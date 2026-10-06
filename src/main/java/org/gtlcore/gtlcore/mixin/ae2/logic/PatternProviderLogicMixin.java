@@ -5,6 +5,8 @@ import org.gtlcore.gtlcore.config.ConfigHolder;
 import org.gtlcore.gtlcore.integration.ae2.AEUtils;
 import org.gtlcore.gtlcore.integration.ae2.compat.MAE2Compat;
 import org.gtlcore.gtlcore.integration.ae2.crafting.IPatternProviderAutoExpand;
+import org.gtlcore.gtlcore.integration.ae2.crafting.PatternCapacityProbe;
+import org.gtlcore.gtlcore.integration.ae2.graph.GraphDispatchContext;
 import org.gtlcore.gtlcore.utils.NumberUtils;
 
 import com.gregtechceu.gtceu.common.data.GTItems;
@@ -20,7 +22,6 @@ import net.minecraftforge.fluids.FluidStack;
 import net.minecraftforge.fluids.capability.IFluidHandler;
 import net.minecraftforge.items.IItemHandler;
 
-import appeng.api.config.Actionable;
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.implementations.blockentities.ICraftingMachine;
 import appeng.api.networking.IManagedGridNode;
@@ -197,7 +198,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         if (side != null) {
             targetBE = host.getBlockEntity().getLevel().getBlockEntity(host.getBlockEntity().getBlockPos().relative(side));
         }
-        boolean accepted = gtlcore$canTargetAccept(target, targetBE,
+        boolean accepted = gtlcore$canTargetAccept(new PatternCapacityProbe(target), targetBE,
                 side == null ? null : side.getOpposite(),
                 gtlcore$toInputCounter(inputHolder), 1);
         if (!accepted) {
@@ -311,12 +312,13 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
                 machineBE.getMetaMachine() instanceof HugeBusPartMachine) {
             return requestedOperations;
         }
-        if (!gtlcore$canTargetAccept(target, targetBE, side, baseInputs, requestedOperations)) {
+        PatternCapacityProbe probe = new PatternCapacityProbe(target);
+        if (!gtlcore$canTargetAccept(probe, targetBE, side, baseInputs, requestedOperations)) {
             long low = 0;
             long high = requestedOperations - 1;
             while (low < high) {
                 long middle = low + ((high - low + 1) >>> 1);
-                if (gtlcore$canTargetAccept(target, targetBE, side, baseInputs, middle)) {
+                if (gtlcore$canTargetAccept(probe, targetBE, side, baseInputs, middle)) {
                     low = middle;
                 } else {
                     high = middle - 1;
@@ -328,7 +330,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
     }
 
     @Unique
-    private boolean gtlcore$canTargetAccept(PatternProviderTarget target, BlockEntity targetBE, Direction side,
+    private boolean gtlcore$canTargetAccept(PatternCapacityProbe probe, BlockEntity targetBE, Direction side,
                                             KeyCounter baseInputs, long operations) {
         if (operations <= 0) {
             return true;
@@ -342,7 +344,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         // dedicated non-overlapping slots, which the aggregate slot heuristic cannot
         // represent (it assumes shared slots and rejects multi-input patterns even at 1x).
         if (targetBE == null || side == null || targetBE instanceof InterfaceLogicHost || gtlcore$isInterfacePart(targetBE, side)) {
-            return gtlcore$targetAcceptsAll(target, baseInputs, operations);
+            return gtlcore$targetAcceptsAll(probe, baseInputs, operations);
         }
 
         var itemCap = targetBE.getCapability(ForgeCapabilities.ITEM_HANDLER, side);
@@ -352,12 +354,12 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         // First pass: each key must fit its own available space (cheap reject).
         // Slot reality is verified precisely below; the aggregate slot heuristic only
         // runs on the aggregate-only path.
-        if (!gtlcore$keysFitIndividually(target, baseInputs, operations)) {
+        if (!gtlcore$keysFitIndividually(probe, baseInputs, operations)) {
             return false;
         }
 
         if (itemCap.isPresent() &&
-                !gtlcore$canItemHandlerAcceptAll(itemCap.orElseThrow(NullPointerException::new), baseInputs, operations)) {
+                !gtlcore$canItemHandlerAcceptAll(probe, itemCap.orElseThrow(NullPointerException::new), baseInputs, operations)) {
             return false;
         }
 
@@ -367,7 +369,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         }
 
         if (!hasHandler) {
-            return gtlcore$targetAcceptsAll(target, baseInputs, operations);
+            return gtlcore$targetAcceptsAll(probe, baseInputs, operations);
         }
         return true;
     }
@@ -384,8 +386,8 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
      * strand the overflow in the provider's sendList and stall the craft).
      */
     @Unique
-    private boolean gtlcore$canItemHandlerAcceptAll(IItemHandler handler, KeyCounter baseInputs, long operations) {
-        int slots = handler.getSlots();
+    private boolean gtlcore$canItemHandlerAcceptAll(PatternCapacityProbe probe, IItemHandler handler, KeyCounter baseInputs, long operations) {
+        int slots = probe.slots(handler);
         AEItemKey[] slotOwner = new AEItemKey[slots];
         long[] slotReserved = new long[slots];
 
@@ -400,10 +402,11 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         }
 
         // Most constrained keys first: fewer usable slots means higher risk of being
-        // squeezed out by greedy allocation.
+        // squeezed out by greedy allocation. Counts do not depend on batch size and are
+        // memoized for this search; sorting must not rescan the inventory on every comparison.
         requirements.sort((a, b) -> Integer.compare(
-                gtlcore$countUsableSlots(handler, a.key().toStack(), slotOwner),
-                gtlcore$countUsableSlots(handler, b.key().toStack(), slotOwner)));
+                probe.usableSlots(handler, a.key()),
+                probe.usableSlots(handler, b.key())));
 
         for (var requirement : requirements) {
             AEItemKey itemKey = requirement.key();
@@ -423,8 +426,8 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
                 // Simulate inserting the whole remainder into this slot. This respects both
                 // filters and unlimited-capacity slots (e.g. gtmthings huge buses), instead of
                 // clamping per-slot capacity to the item's vanilla max stack size.
-                long probe = remaining + slotReserved[i];
-                int chunk = (int) Math.min(probe, Integer.MAX_VALUE);
+                long probeAmount = remaining + slotReserved[i];
+                int chunk = (int) Math.min(probeAmount, Integer.MAX_VALUE);
                 ItemStack remainder = handler.insertItem(i, itemKey.toStack(chunk), true);
                 long accepted = remainder.isEmpty() ? chunk : Math.max(0, chunk - remainder.getCount());
                 long free = accepted - slotReserved[i];
@@ -446,24 +449,6 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         }
 
         return true;
-    }
-
-    @Unique
-    private int gtlcore$countUsableSlots(IItemHandler handler, ItemStack representative, AEItemKey[] slotOwner) {
-        int usable = 0;
-        for (int i = 0; i < handler.getSlots(); i++) {
-            ItemStack current = handler.getStackInSlot(i);
-            if (!current.isEmpty() && !ItemStack.isSameItem(current, representative)) {
-                continue;
-            }
-            if (current.isEmpty() && slotOwner[i] != null) {
-                continue;
-            }
-            if (handler.insertItem(i, representative.copyWithCount(1), true).isEmpty()) {
-                usable++;
-            }
-        }
-        return usable;
     }
 
     /**
@@ -542,8 +527,8 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
      * path instead.
      */
     @Unique
-    private boolean gtlcore$targetAcceptsAll(PatternProviderTarget target, KeyCounter baseInputs, long operations) {
-        if (!gtlcore$keysFitIndividually(target, baseInputs, operations)) {
+    private boolean gtlcore$targetAcceptsAll(PatternCapacityProbe probe, KeyCounter baseInputs, long operations) {
+        if (!gtlcore$keysFitIndividually(probe, baseInputs, operations)) {
             return false;
         }
 
@@ -558,7 +543,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
                 continue;
             }
 
-            long available = target.insert(itemKey, Long.MAX_VALUE, Actionable.SIMULATE);
+            long available = probe.available(itemKey);
             int maxStack = Math.max(1, itemKey.getItem().getMaxStackSize());
             requiredItemSlots = NumberUtils.saturatedAdd(requiredItemSlots, gtlcore$ceilDiv(amount, maxStack));
             availableItemSlots = Math.max(availableItemSlots, gtlcore$ceilDiv(available, maxStack));
@@ -568,7 +553,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
     }
 
     @Unique
-    private boolean gtlcore$keysFitIndividually(PatternProviderTarget target, KeyCounter baseInputs, long operations) {
+    private boolean gtlcore$keysFitIndividually(PatternCapacityProbe probe, KeyCounter baseInputs, long operations) {
         // Per-key capacity check: each key must fit its own required amount.
         // Aggregating per AEKeyType with a min() capacity would let a single
         // special-stack item (e.g. maxStackSize=1) cap the whole pattern.
@@ -578,7 +563,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
                 continue;
             }
 
-            long available = target.insert(input.getKey(), Long.MAX_VALUE, Actionable.SIMULATE);
+            long available = probe.available(input.getKey());
             if (amount > available) {
                 return false;
             }
@@ -614,6 +599,13 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
     @Unique
     private KeyCounter gtlcore$toInputCounter(IPatternDetails pattern) {
         var baseInputs = new KeyCounter();
+        var selected = GraphDispatchContext.selectedInputs();
+        if (selected != null) {
+            selected.forEach((key, amount) -> {
+                if (!AEUtils.isIntegratedCircuit(key)) baseInputs.add(key, amount);
+            });
+            return baseInputs;
+        }
         for (var input : pattern.getInputs()) {
             var possibleInputs = input.getPossibleInputs();
             if (possibleInputs.length == 0) {
@@ -623,7 +615,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
             if (AEUtils.isIntegratedCircuit(possibleInputs[0].what())) {
                 continue;
             }
-            baseInputs.add(possibleInputs[0].what(), input.getMultiplier());
+            baseInputs.add(possibleInputs[0].what(), Math.multiplyExact(possibleInputs[0].amount(), input.getMultiplier()));
         }
         return baseInputs;
     }
