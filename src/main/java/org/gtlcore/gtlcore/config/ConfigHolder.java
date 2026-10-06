@@ -178,8 +178,5 @@ public class ConfigHolder {
         @Configurable
         @Configurable.Comment("config.gtlcore.option.enableBatchProcessingLogging.comment")
         public boolean enableBatchProcessingLogging = false;
-        @Configurable
-        @Configurable.Comment("config.gtlcore.option.enableAe2PatternCapacityScanLogging.comment")
-        public boolean enableAe2PatternCapacityScanLogging = false;
     }
 }

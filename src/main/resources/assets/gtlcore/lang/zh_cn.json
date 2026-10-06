@@ -841,8 +841,6 @@
   "message.gtlcore.structure_detection_running": "结构检测正在进行中",
   "tooltip.gtlcore.infinity_cell.uuid": "UUID: ",
   "tooltip.gtlcore.infinity_cell.bytes": "字节: ",
-  "config.gtlcore.option.enableAe2PatternCapacityScanLogging": "启用样板容量扫描日志（调试智能翻倍性能）",
-  "config.gtlcore.option.enableAe2PatternCapacityScanLogging.comment": "调试功能：记录智能翻倍的超慢扫描告警\n用于定位 AE 合成发配卡顿"
   "gui.gtlcore.preview.fullscreen": "全屏预览",
   "gui.gtlcore.preview.restore": "退出全屏",
   "gui.gtlcore.preview.height": "主方块距离底层 %s 格",

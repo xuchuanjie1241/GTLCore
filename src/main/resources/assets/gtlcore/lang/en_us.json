@@ -841,8 +841,6 @@
   "message.gtlcore.structure_detection_running": "Structure detection is already running.",
   "tooltip.gtlcore.infinity_cell.uuid": "UUID: ",
   "tooltip.gtlcore.infinity_cell.bytes": "Byte: ",
-  "config.gtlcore.option.enableAe2PatternCapacityScanLogging": "Enable pattern capacity scan logging (debug auto-expand performance)",
-  "config.gtlcore.option.enableAe2PatternCapacityScanLogging.comment": "Debug: log slow-scan warnings\nUsed to diagnose AE crafting dispatch stalls"
   "gui.gtlcore.preview.fullscreen": "Fullscreen preview",
   "gui.gtlcore.preview.restore": "Exit fullscreen",
   "gui.gtlcore.preview.height": "Controller: %s blocks above bottom",

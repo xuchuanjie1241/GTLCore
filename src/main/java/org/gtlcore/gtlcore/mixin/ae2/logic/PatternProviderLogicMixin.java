@@ -1,24 +1,14 @@
 package org.gtlcore.gtlcore.mixin.ae2.logic;
 
-import org.gtlcore.gtlcore.GTLCore;
 import org.gtlcore.gtlcore.api.crafting.IAutoExpandSettings;
 import org.gtlcore.gtlcore.config.ConfigHolder;
 import org.gtlcore.gtlcore.integration.ae2.AEUtils;
 import org.gtlcore.gtlcore.integration.ae2.compat.MAE2Compat;
 import org.gtlcore.gtlcore.integration.ae2.crafting.IPatternProviderAutoExpand;
-import org.gtlcore.gtlcore.mixin.ae2.storage.CompositeStorageAccessor;
-import org.gtlcore.gtlcore.mixin.ae2.storage.DelegatingMEInventoryAccessor;
-import org.gtlcore.gtlcore.mixin.ae2.storage.FluidHandlerFacadeAccessor;
-import org.gtlcore.gtlcore.mixin.ae2.storage.ItemHandlerFacadeAccessor;
-import org.gtlcore.gtlcore.mixin.ae2.storage.NetworkStorageAccessor;
 import org.gtlcore.gtlcore.utils.NumberUtils;
 
 import com.gregtechceu.gtceu.common.data.GTItems;
 
-import com.lowdragmc.lowdraglib.side.fluid.IFluidTransfer;
-import com.lowdragmc.lowdraglib.side.fluid.forge.FluidHelperImpl;
-
-import net.minecraft.core.BlockPos;
 import net.minecraft.core.Direction;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.world.entity.player.Player;
@@ -39,15 +29,11 @@ import appeng.api.stacks.AEFluidKey;
 import appeng.api.stacks.AEItemKey;
 import appeng.api.stacks.AEKey;
 import appeng.api.stacks.KeyCounter;
-import appeng.api.storage.MEStorage;
 import appeng.helpers.InterfaceLogicHost;
 import appeng.helpers.patternprovider.PatternProviderLogic;
 import appeng.helpers.patternprovider.PatternProviderLogicHost;
 import appeng.helpers.patternprovider.PatternProviderTarget;
 import appeng.hooks.ticking.TickHandler;
-import appeng.me.storage.CompositeStorage;
-import appeng.me.storage.DelegatingMEInventory;
-import appeng.me.storage.NetworkStorage;
 import com.hepdd.gtmthings.common.block.machine.multiblock.part.HugeBusPartMachine;
 import org.spongepowered.asm.mixin.Final;
 import org.spongepowered.asm.mixin.Mixin;
@@ -59,7 +45,6 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Map;
@@ -92,14 +77,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
     }
 
     @Unique
-    private PatternProviderTarget gtlcore$findAdapterCached(Direction direction) {
-        long now = TickHandler.instance().getCurrentTick();
-        if (now != gtlcore$adapterTick) {
-            gtlcore$adapterTick = now;
-            gtlcore$adapterCache.clear();
-        }
-        return gtlcore$adapterCache.computeIfAbsent(direction, this::findAdapter);
-    }
+    private long gtlcore$rejectTick = Long.MIN_VALUE;
 
     @Shadow(remap = false)
     private boolean isBlocking() {
@@ -207,18 +185,9 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         }
     }
 
-    /**
-     * Push-time bookkeeping for auto-expanded batches. The capacity estimate already sized the
-     * batch; this hook must NOT enforce all-or-nothing acceptance - vanilla accepts a batch when
-     * every key can insert at all and drips the unfit remainder through the send list. Forcing
-     * full acceptance turns a one-operation overestimate into a permanent stall (nothing ever
-     * enters, nothing ever drains). Instead: detect when the real machine cannot take the whole
-     * batch, refresh the caches so the next estimate rescans, and cool the provider down for the
-     * rest of the tick - then let vanilla decide acceptance.
-     */
-    @Inject(method = "adapterAcceptsAll", at = @At("HEAD"), remap = false)
-    private void gtlcore$trackTargetCapacity(PatternProviderTarget target, KeyCounter[] inputHolder,
-                                             CallbackInfoReturnable<Boolean> cir) {
+    @Inject(method = "adapterAcceptsAll", at = @At("HEAD"), remap = false, cancellable = true)
+    private void gtlcore$requireFullTargetCapacity(PatternProviderTarget target, KeyCounter[] inputHolder,
+                                                   CallbackInfoReturnable<Boolean> cir) {
         if (!gtlcore$autoExpand) {
             return;
         }
@@ -228,126 +197,24 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
         if (side != null) {
             targetBE = host.getBlockEntity().getLevel().getBlockEntity(host.getBlockEntity().getBlockPos().relative(side));
         }
-        if (targetBE == null || side == null || targetBE instanceof InterfaceLogicHost || gtlcore$isInterfacePart(targetBE, side) ||
-                gtlcore$isHugeComposite(targetBE, side)) {
-            gtlcore$accountPushAgainstProbeCache(side, inputHolder);
-            return;
-        }
-        boolean allFits = gtlcore$canTargetAccept(target, targetBE,
-                side.getOpposite(), gtlcore$toInputCounter(inputHolder), 1);
-        if (!allFits) {
-            // The cached capacity estimate was stale - drop it so the next evaluation rescans.
-            gtlcore$capCacheTick = Long.MIN_VALUE;
-            gtlcore$snapshots.clear();
-            gtlcore$snapTick = Long.MIN_VALUE;
-            // But not within the same tick: the dispatch loop retries every round, and each
-            // retry would otherwise rescan a machine that just told us it is full. Cool down
-            // until next tick - the machine drains over ticks anyway, so this cannot deadlock.
+        boolean accepted = gtlcore$canTargetAccept(target, targetBE,
+                side == null ? null : side.getOpposite(),
+                gtlcore$toInputCounter(inputHolder), 1);
+        if (!accepted) {
+            // A rejected push means the target is full; the dispatch loop would otherwise rescan
+            // it every remaining round this tick. Cool down until next tick - machines drain over
+            // ticks, so this cannot deadlock.
             gtlcore$rejectTick = TickHandler.instance().getCurrentTick();
         }
-    }
-
-    @Unique
-    private static final long CAP_CACHE_TTL_TICKS = 20;
-
-    @Unique
-    private long gtlcore$rejectTick = Long.MIN_VALUE;
-
-    /**
-     * Per-tick per-side adapter cache: AE2's own target cache is invalidated on every target
-     * change (i.e. every insert), and each rebuild calls getCapability on the machine - which
-     * constructs the whole merged inventory view. One cache entry per tick per side is safe
-     * because targets cannot meaningfully change within a tick.
-     */
-    @Unique
-    private long gtlcore$adapterTick = Long.MIN_VALUE;
-    @Unique
-    private final Map<Direction, PatternProviderTarget> gtlcore$adapterCache = new HashMap<>();
-
-    /** Per-tick probe results shared across patterns hitting the same side of this provider. */
-    @Unique
-    private long gtlcore$probeTick = Long.MIN_VALUE;
-    @Unique
-    private final Map<Direction, Map<AEKey, Long>> gtlcore$probeCache = new HashMap<>();
-
-    /** Per-interface subnet slot snapshots, rebuilt at most once per TTL. */
-    @Unique
-    private long gtlcore$subnetTick = Long.MIN_VALUE;
-    @Unique
-    private final Map<BlockPos, MachineSnapshot> gtlcore$subnetSnapshots = new HashMap<>();
-
-    @Unique
-    private long gtlcore$capCacheTick = Long.MIN_VALUE;
-    @Unique
-    private IPatternDetails gtlcore$capCachePattern;
-    @Unique
-    private long gtlcore$capCacheCapacity;
-    @Unique
-    private long gtlcore$capCacheCeiling;
-
-    @Unique
-    private static boolean gtlcore$scanLoggingEnabled() {
-        return ConfigHolder.INSTANCE != null &&
-                ConfigHolder.INSTANCE.debugLogging.enableAe2PatternCapacityScanLogging;
+        cir.setReturnValue(accepted);
     }
 
     @Override
     public long gtlcore$getMaxPatternOperations(IPatternDetails pattern, long requestedOperations) {
-        // The capacity scan walks every active side and simulates inserts per slot, which is
-        // expensive; the crafting dispatch loop calls this per task per provider per round,
-        // and with pack-wide auto-expand the distinct (provider, pattern) pairs alone reach
-        // tens of thousands per tick. Cache with a 1-second TTL: overestimates are caught by
-        // adapterAcceptsAll at push time (which also invalidates this cache), so a stale
-        // value can never cause a wrong push.
-        long now = TickHandler.instance().getCurrentTick();
-        boolean log = gtlcore$scanLoggingEnabled();
-        if (log) {}
-        if (now == gtlcore$rejectTick) {
-            // A push was already rejected this tick - the target has not had time to drain.
-            // Report "1" without rescanning; next tick reevaluates normally.
-            if (log) {}
-            return 1;
-        }
-        // The cache stores a capacity LOWER BOUND (pattern-keyed, request-independent):
-        // dispatch calls arrive with a shrinking "remaining" count every round, so keying on
-        // the requested amount would miss forever. min(bound, requested) is always safe -
-        // overestimates get caught by adapterAcceptsAll at push time (and invalidate this).
-        if (now - gtlcore$capCacheTick < CAP_CACHE_TTL_TICKS && gtlcore$capCachePattern == pattern) {
-            boolean ceilingWasHit = gtlcore$capCacheCapacity == gtlcore$capCacheCeiling;
-            boolean needRescan = ceilingWasHit && requestedOperations > gtlcore$capCacheCapacity;
-            if (!needRescan) {
-                if (log) {}
-                return Math.min(gtlcore$capCacheCapacity, requestedOperations);
-            }
-        }
-        long t0 = log ? System.nanoTime() : 0;
-        long computed = gtlcore$computeMaxPatternOperations(pattern, requestedOperations);
-        if (log) {
-            long elapsed = System.nanoTime() - t0;
-            if (elapsed > 50_000_000L) {
-                GTLCore.LOGGER.warn(
-                        "[GTLCore] slow pattern capacity scan: {}ms at {} for pattern {} (result={}, requested={})",
-                        elapsed / 1_000_000, host.getBlockEntity().getBlockPos().toShortString(),
-                        pattern.getPrimaryOutput().what().toString(), computed, requestedOperations);
-            }
-        }
-        // Only cache real capacity results: the "blocked / no target → 1" verdicts are cheap
-        // to recompute and state-critical - caching them across ticks locks blocking-mode
-        // providers into a one-per-push loop after the machine drains.
-        if (computed > 1) {
-            gtlcore$capCacheTick = now;
-            gtlcore$capCachePattern = pattern;
-            gtlcore$capCacheCapacity = computed;
-            gtlcore$capCacheCeiling = requestedOperations;
-        } else {
-            gtlcore$capCacheTick = Long.MIN_VALUE;
-        }
-        return computed;
-    }
-
-    @Unique
-    private long gtlcore$computeMaxPatternOperations(IPatternDetails pattern, long requestedOperations) {
         if (!gtlcore$autoExpand || requestedOperations <= 1 || !pattern.supportsPushInputsToExternalInventory()) {
+            return Math.min(requestedOperations, 1);
+        }
+        if (gtlcore$rejectTick == TickHandler.instance().getCurrentTick()) {
             return Math.min(requestedOperations, 1);
         }
 
@@ -398,7 +265,7 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
                 }
             }
 
-            var target = gtlcore$findAdapterCached(direction);
+            var target = findAdapter(direction);
             if (target == null || (isBlocking() && target.containsPatternInput(patternInputs))) {
                 continue;
             }
@@ -436,506 +303,30 @@ public abstract class PatternProviderLogicMixin implements IAutoExpandSettings, 
     @Unique
     private long gtlcore$findMaxOperations(PatternProviderTarget target, BlockEntity targetBE, Direction side,
                                            KeyCounter baseInputs, long requestedOperations) {
-        // Giant GTMThings buses/hatches: every kind gets its own 2.1G slot, so capacity never
-        // binds - only the KIND count does (a new kind needs a free slot).
+        // Giant GTMThings buses/hatches are built for bulk intake: one huge shared inventory,
+        // no per-slot filter reality to respect. Capacity checks exist to stop over-expanded
+        // batches from stranding items in sendList, which cannot happen there - and the check
+        // itself walks a huge merged view, so skip it entirely.
         if (targetBE instanceof com.gregtechceu.gtceu.api.machine.IMachineBlockEntity machineBE &&
                 machineBE.getMetaMachine() instanceof HugeBusPartMachine) {
-            var hugeCap = targetBE.getCapability(ForgeCapabilities.ITEM_HANDLER, side);
-            if (hugeCap.isPresent()) {
-                IItemHandler handler = hugeCap.orElseThrow(NullPointerException::new);
-                int freeSlots = 0;
-                for (int i = 0; i < handler.getSlots(); i++) {
-                    if (handler.getStackInSlot(i).isEmpty()) {
-                        freeSlots++;
-                    }
-                }
-                for (var input : baseInputs) {
-                    if (!(input.getKey() instanceof AEItemKey itemKey)) {
-                        continue;
-                    }
-                    boolean present = false;
-                    for (int i = 0; i < handler.getSlots(); i++) {
-                        if (ItemStack.isSameItem(handler.getStackInSlot(i), itemKey.toStack())) {
-                            present = true;
-                            break;
-                        }
-                    }
-                    if (!present) {
-                        if (freeSlots <= 0) {
-                            return 0;
-                        }
-                        freeSlots--;
-                    }
-                }
-            }
             return requestedOperations;
         }
-        // Network-backed interface targets (incl. ExtendedAE interfaces feeding subnets):
-        // resolve the interface's network storage down to the real machine handlers and run the
-        // exact slot-aware computation against them - this sees the cross-key slot competition
-        // that per-key network probes cannot (e.g. 16-stack gears next to 64-stack rods).
-        if (targetBE == null || side == null || targetBE instanceof InterfaceLogicHost || gtlcore$isInterfacePart(targetBE, side)) {
-            if (targetBE != null && side != null) {
-                long subnetCap = gtlcore$subnetCapacity(targetBE, side, baseInputs, requestedOperations);
-                if (subnetCap >= 0) {
-                    return subnetCap;
-                }
-            }
-            return gtlcore$probeCapacity(target, targetBE, side, baseInputs, requestedOperations);
-        }
-        // Fast path: full batch fits (verified against the real handler).
-        if (gtlcore$canTargetAccept(target, targetBE, side, baseInputs, requestedOperations)) {
-            return requestedOperations;
-        }
-        // Single-ingredient patterns have no slot competition by construction: one probe is
-        // the exact answer, no batch check needed.
-        if (gtlcore$isSingleIngredient(baseInputs)) {
-            return gtlcore$probeCapacity(target, targetBE, side, baseInputs, requestedOperations);
-        }
-        // Huge composite inventories (merged multi-part views with hundreds of slots): slot
-        // competition cannot strand anything at that scale, and ANY capability walk over the
-        // merged view is quadratic. Probe per key once instead; the per-tick probe cache shares
-        // results across patterns and providers.
-        var itemCap = targetBE.getCapability(ForgeCapabilities.ITEM_HANDLER, side);
-        if (itemCap.isPresent() && itemCap.orElseThrow(NullPointerException::new).getSlots() > 256) {
-            return gtlcore$probeCapacity(target, targetBE, side, baseInputs, requestedOperations);
-        }
-        // Small machines: exact slot-aware computation, but against a per-TTL in-memory
-        // snapshot of the container - the real handler is only walked when the snapshot is
-        // rebuilt, and every pattern on this side shares it.
-        MachineSnapshot snap = gtlcore$snapshotMachine(targetBE, side);
-        long result = gtlcore$snapshotCapacity(snap, baseInputs, requestedOperations);
-        return result;
-    }
-
-    @Unique
-    private static boolean gtlcore$isHugeComposite(BlockEntity targetBE, Direction side) {
-        if (targetBE == null || side == null) {
-            return false;
-        }
-        var itemCap = targetBE.getCapability(ForgeCapabilities.ITEM_HANDLER, side);
-        return itemCap.isPresent() && itemCap.orElseThrow(NullPointerException::new).getSlots() > 256;
-    }
-
-    @Unique
-    private void gtlcore$accountPushAgainstProbeCache(Direction side, KeyCounter[] inputHolder) {
-        if (side == null) {
-            return;
-        }
-        Map<AEKey, Long> cache = gtlcore$probeCache.get(side);
-        if (cache == null || cache.isEmpty()) {
-            return;
-        }
-        for (KeyCounter counter : inputHolder) {
-            for (var input : counter) {
-                Long cached = cache.get(input.getKey());
-                if (cached != null) {
-                    cache.put(input.getKey(), Math.max(0, cached - input.getLongValue()));
-                }
-            }
-        }
-    }
-
-    @Unique
-    private static boolean gtlcore$slotAccepts(SlotSnap s, AEKey key, Map<AEKey, Map<Integer, Boolean>> validityMemo) {
-        // Memo key combines handler identity with the slot index (slot indices repeat across
-        // handlers).
-        int memoKey = System.identityHashCode(s.handler()) * 100003 + s.slot();
-        var memo = validityMemo.computeIfAbsent(key, k -> new HashMap<>());
-        Boolean cached = memo.get(memoKey);
-        if (cached != null) {
-            return cached;
-        }
-        boolean ok;
-        if (s.handler() instanceof IItemHandler ih) {
-            ok = ih.insertItem(s.slot(), ((AEItemKey) key).toStack(1), true).isEmpty();
-        } else if (s.handler() instanceof IFluidHandler fh) {
-            // Per-tank probe: list-level fill() would happily land in a different tank (e.g. the
-            // input tank) and mislabel an output tank as usable.
-            IFluidTransfer ft = gtlcore$asFluidTransfer(fh);
-            ok = ft != null ? gtlcore$probeTankAccepts(ft, s.slot(), (AEFluidKey) key) : fh.isFluidValid(s.slot(), ((AEFluidKey) key).toStack(1));
-        } else {
-            ok = true;
-        }
-        memo.put(memoKey, ok);
-        return ok;
-    }
-
-    /**
-     * Per-tank fill probe with a guard: some wrappers (LDLib FluidTransferWrapper) implement
-     * IFluidTransfer but throw NotImplementedException on the per-tank overload - treat those
-     * tanks as unusable rather than letting the exception kill the server tick.
-     */
-    @Unique
-    private static boolean gtlcore$probeTankAccepts(IFluidTransfer transfer, int tank, AEFluidKey key) {
-        try {
-            return transfer.fill(tank, FluidHelperImpl.toFluidStack(key.toStack(1)), true, false) == 1;
-        } catch (RuntimeException e) {
-            return false;
-        }
-    }
-
-    @Unique
-    private static IFluidTransfer gtlcore$asFluidTransfer(IFluidHandler handler) {
-        if (handler instanceof IFluidTransfer transfer) {
-            return transfer;
-        }
-        // Forge-facing anonymous wrapper (FluidTransferHelperImpl$1): reflect the captured
-        // delegate field - the name is compiler-generated but stable.
-        try {
-            for (var field : handler.getClass().getDeclaredFields()) {
-                if (field.getName().equals("val$fluidTransfer")) {
-                    field.setAccessible(true);
-                    return (IFluidTransfer) field.get(handler);
-                }
-            }
-        } catch (ReflectiveOperationException | RuntimeException ignored) {}
-        return null;
-    }
-
-    @Unique
-    private static boolean gtlcore$isSingleIngredient(KeyCounter baseInputs) {
-        int count = 0;
-        for (var input : baseInputs) {
-            if (input.getLongValue() > 0 && ++count > 1) {
-                return false;
-            }
-        }
-        return count == 1;
-    }
-
-    /**
-     * One slot/tank of a snapshot: key currently inside (null = empty), how much more fits, slot limit, and the owning
-     * handler+index for filter checks.
-     */
-    @Unique
-    private record SlotSnap(AEKey key, long free, long limit, Object handler, int slot) {}
-
-    @Unique
-    private record MachineSnapshot(List<SlotSnap> items, List<SlotSnap> fluids,
-                                   Map<AEKey, Map<Integer, Boolean>> itemValidity, Map<AEKey, Map<Integer, Boolean>> fluidValidity) {}
-
-    /** Per-side snapshots, rebuilt at most once per TTL; the real handler is only walked then. */
-    @Unique
-    private long gtlcore$snapTick = Long.MIN_VALUE;
-    @Unique
-    private final Map<Direction, MachineSnapshot> gtlcore$snapshots = new HashMap<>();
-
-    /**
-     * The snapshot IS the expensive part (one capability walk); everything per-pattern afterwards
-     * is pure arithmetic against it. Circuits stay out of baseInputs, so a circuit occupying a
-     * slot is just an occupied slot here - it never appears as capacity for anything.
-     */
-    @Unique
-    private MachineSnapshot gtlcore$snapshotMachine(BlockEntity targetBE, Direction side) {
-        long now = TickHandler.instance().getCurrentTick();
-        if (now - gtlcore$snapTick >= CAP_CACHE_TTL_TICKS) {
-            gtlcore$snapTick = now;
-            gtlcore$snapshots.clear();
-        }
-        MachineSnapshot cached = gtlcore$snapshots.get(side);
-        if (cached != null) {
-            return cached;
-        }
-        List<SlotSnap> items = new ArrayList<>();
-        List<SlotSnap> fluids = new ArrayList<>();
-        IItemHandler itemHandler = null;
-        IFluidHandler fluidHandler = null;
-        var itemCap = targetBE.getCapability(ForgeCapabilities.ITEM_HANDLER, side);
-        if (itemCap.isPresent()) {
-            itemHandler = itemCap.orElseThrow(NullPointerException::new);
-            for (int i = 0; i < itemHandler.getSlots(); i++) {
-                ItemStack cur = itemHandler.getStackInSlot(i);
-                if (cur.isEmpty()) {
-                    long limit = itemHandler.getSlotLimit(i);
-                    items.add(new SlotSnap(null, limit, limit, itemHandler, i));
+        if (!gtlcore$canTargetAccept(target, targetBE, side, baseInputs, requestedOperations)) {
+            long low = 0;
+            long high = requestedOperations - 1;
+            while (low < high) {
+                long middle = low + ((high - low + 1) >>> 1);
+                if (gtlcore$canTargetAccept(target, targetBE, side, baseInputs, middle)) {
+                    low = middle;
                 } else {
-                    AEItemKey key = AEItemKey.of(cur);
-                    ItemStack probe = key.toStack(Integer.MAX_VALUE);
-                    ItemStack rem = itemHandler.insertItem(i, probe, true);
-                    long accepted = rem.isEmpty() ? Integer.MAX_VALUE : Integer.MAX_VALUE - (long) rem.getCount();
-                    items.add(new SlotSnap(key, accepted, itemHandler.getSlotLimit(i), itemHandler, i));
+                    high = middle - 1;
                 }
             }
+            return low;
         }
-        var fluidCap = targetBE.getCapability(ForgeCapabilities.FLUID_HANDLER, side);
-        if (fluidCap.isPresent()) {
-            fluidHandler = fluidCap.orElseThrow(NullPointerException::new);
-            for (int i = 0; i < fluidHandler.getTanks(); i++) {
-                FluidStack cur = fluidHandler.getFluidInTank(i);
-                if (cur.isEmpty()) {
-                    long cap = fluidHandler.getTankCapacity(i);
-                    fluids.add(new SlotSnap(null, cap, cap, fluidHandler, i));
-                } else {
-                    AEFluidKey key = AEFluidKey.of(cur);
-                    IFluidTransfer transfer = gtlcore$asFluidTransfer(fluidHandler);
-                    long accepted = transfer != null ? transfer.fill(i, FluidHelperImpl.toFluidStack(key.toStack(Integer.MAX_VALUE)), true, false) : fluidHandler.fill(key.toStack(Integer.MAX_VALUE), IFluidHandler.FluidAction.SIMULATE);
-                    fluids.add(new SlotSnap(key, accepted, fluidHandler.getTankCapacity(i), fluidHandler, i));
-                }
-            }
-        }
-        MachineSnapshot snap = new MachineSnapshot(items, fluids, new HashMap<>(), new HashMap<>());
-        gtlcore$snapshots.put(side, snap);
-        return snap;
+        return requestedOperations;
     }
 
-    /** In-memory feasibility check mirroring the real batch acceptance check's greedy allocation. */
-    @Unique
-    private boolean gtlcore$snapshotFits(MachineSnapshot snap, KeyCounter baseInputs, long ops) {
-        List<Entry<AEItemKey>> itemReqs = new ArrayList<>();
-        List<Entry<AEFluidKey>> fluidReqs = new ArrayList<>();
-        for (var input : baseInputs) {
-            if (input.getKey() instanceof AEItemKey itemKey && input.getLongValue() > 0) {
-                itemReqs.add(new Entry<>(itemKey, input.getLongValue()));
-            } else if (input.getKey() instanceof AEFluidKey fluidKey && input.getLongValue() > 0) {
-                fluidReqs.add(new Entry<>(fluidKey, input.getLongValue()));
-            }
-        }
-        if (!gtlcore$snapshotFitsItems(snap.items(), itemReqs, ops, snap.itemValidity())) {
-            return false;
-        }
-        return gtlcore$snapshotFitsItems(snap.fluids(), fluidReqs, ops, snap.fluidValidity());
-    }
-
-    @Unique
-    private static <K extends AEKey> boolean gtlcore$snapshotFitsItems(List<SlotSnap> slots, List<Entry<K>> requirements, long ops,
-                                                                       Map<AEKey, Map<Integer, Boolean>> validityMemo) {
-        if (requirements.isEmpty()) {
-            return true;
-        }
-        int n = slots.size();
-        AEKey[] owner = new AEKey[n];
-        long[] reserved = new long[n];
-        for (var req : requirements) {
-            K key = req.key();
-            long perOp = req.amount();
-            int itemMaxStack = key instanceof AEItemKey ik ? ik.toStack().getMaxStackSize() : Integer.MAX_VALUE;
-            long remaining = NumberUtils.saturatedMultiply(perOp, ops);
-            for (int i = 0; i < n && remaining > 0; i++) {
-                SlotSnap s = slots.get(i);
-                long capacity;
-                if (s.key() == null) {
-                    if (owner[i] != null && owner[i] != key) {
-                        continue;
-                    }
-                    // Empty slots are NOT automatically usable: IO-restricted or filtered slots
-                    // (circuit, battery, output...) reject inserts. The 1-unit probe covers every
-                    // rejection reason; results are memoized per (handler, slot, key) for the whole
-                    // snapshot lifetime because each probe may walk a composite handler.
-                    if (s.handler() != null && !gtlcore$slotAccepts(s, key, validityMemo)) {
-                        continue;
-                    }
-                    // Normal slots cap at the item's max stack size; unlimited-capacity
-                    // slots (limit way past any stack size) take the full limit instead.
-                    capacity = s.limit() > 1024 ? s.limit() : Math.min(s.limit(), itemMaxStack);
-                } else {
-                    if (!s.key().equals(key)) {
-                        continue;
-                    }
-                    capacity = s.free();
-                }
-                long free = capacity - reserved[i];
-                if (free <= 0) {
-                    continue;
-                }
-                long taken = Math.min(free, remaining);
-                reserved[i] += taken;
-                if (s.key() == null) {
-                    owner[i] = key;
-                }
-                remaining -= taken;
-            }
-            if (remaining > 0) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    /** Exact capacity: binary search, but every feasibility probe runs against the snapshot. */
-    @Unique
-    private long gtlcore$snapshotCapacity(MachineSnapshot snap, KeyCounter baseInputs, long requestedOperations) {
-        if (gtlcore$snapshotFits(snap, baseInputs, requestedOperations)) {
-            return requestedOperations;
-        }
-        if (!gtlcore$snapshotFits(snap, baseInputs, 1)) {
-            return 0;
-        }
-        long low = 0;
-        long high = requestedOperations - 1;
-        while (low < high) {
-            long middle = low + ((high - low + 1) >>> 1);
-            if (gtlcore$snapshotFits(snap, baseInputs, middle)) {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        return low;
-    }
-
-    /**
-     * Exact subnet slot capacity for interface targets: walk the interface's network storage
-     * down to the real machine handlers behind its storage buses (NetworkStorage ->
-     * MEInventoryHandler -> CompositeStorage -> ExternalStorageFacade -> handler), snapshot all
-     * of their slots once per TTL, and run the exact slot-aware allocation against the combined
-     * view. This sees cross-key slot competition that per-key probes cannot. Returns -1 when the
-     * network view cannot be resolved (caller falls back to probes).
-     */
-    @Unique
-    private long gtlcore$subnetCapacity(BlockEntity targetBE, Direction side, KeyCounter baseInputs,
-                                        long requestedOperations) {
-        InterfaceLogicHost logicHost = targetBE instanceof InterfaceLogicHost ih ? ih : (targetBE instanceof IPartHost ph && ph.getPart(side) instanceof InterfaceLogicHost ih2 ? ih2 : null);
-        if (logicHost == null) {
-            return -1;
-        }
-        long now = TickHandler.instance().getCurrentTick();
-        if (now - gtlcore$subnetTick >= CAP_CACHE_TTL_TICKS) {
-            gtlcore$subnetTick = now;
-            gtlcore$subnetSnapshots.clear();
-        }
-        MachineSnapshot snap = gtlcore$subnetSnapshots.get(targetBE.getBlockPos());
-        if (snap == null) {
-            snap = gtlcore$buildSubnetSnapshot(logicHost);
-            if (snap == null) {
-                return -1;
-            }
-            gtlcore$subnetSnapshots.put(targetBE.getBlockPos(), snap);
-        }
-        return gtlcore$snapshotCapacity(snap, baseInputs, requestedOperations);
-    }
-
-    @Unique
-    private MachineSnapshot gtlcore$buildSubnetSnapshot(InterfaceLogicHost logicHost) {
-        var gridNode = logicHost.getInterfaceLogic().getActionableNode();
-        var grid = gridNode == null ? null : gridNode.getGrid();
-        if (grid == null || !(grid.getStorageService().getInventory() instanceof NetworkStorage net)) {
-            return null;
-        }
-        List<SlotSnap> items = new ArrayList<>();
-        List<SlotSnap> fluids = new ArrayList<>();
-        for (var tier : ((NetworkStorageAccessor) net).gtlcore$getPriorityInventory().values()) {
-            for (MEStorage storage : tier) {
-                MEStorage core = storage;
-                int unwrapDepth = 0;
-                while (core instanceof DelegatingMEInventory delegating && unwrapDepth++ < 8) {
-                    core = ((DelegatingMEInventoryAccessor) delegating).gtlcore$getDelegate();
-                }
-                if (core instanceof CompositeStorage composite) {
-                    for (MEStorage inner : ((CompositeStorageAccessor) composite).gtlcore$getStorages().values()) {
-                        gtlcore$collectFacadeSlots(inner, items, fluids);
-                    }
-                } else {
-                    gtlcore$collectFacadeSlots(core, items, fluids);
-                }
-            }
-        }
-        return new MachineSnapshot(items, fluids, new HashMap<>(), new HashMap<>());
-    }
-
-    @Unique
-    private static void gtlcore$collectFacadeSlots(MEStorage storage, List<SlotSnap> items, List<SlotSnap> fluids) {
-        if (storage instanceof ItemHandlerFacadeAccessor itemFacade) {
-            IItemHandler handler = itemFacade.gtlcore$getHandler();
-            for (int i = 0; i < handler.getSlots(); i++) {
-                ItemStack cur = handler.getStackInSlot(i);
-                if (cur.isEmpty()) {
-                    long limit = handler.getSlotLimit(i);
-                    items.add(new SlotSnap(null, limit, limit, handler, i));
-                } else {
-                    AEItemKey key = AEItemKey.of(cur);
-                    ItemStack probe = key.toStack(Integer.MAX_VALUE);
-                    ItemStack rem = handler.insertItem(i, probe, true);
-                    long accepted = rem.isEmpty() ? Integer.MAX_VALUE : Integer.MAX_VALUE - (long) rem.getCount();
-                    items.add(new SlotSnap(key, accepted, handler.getSlotLimit(i), handler, i));
-                }
-            }
-        } else if (storage instanceof FluidHandlerFacadeAccessor fluidFacade) {
-            IFluidHandler handler = fluidFacade.gtlcore$getHandler();
-            for (int i = 0; i < handler.getTanks(); i++) {
-                FluidStack cur = handler.getFluidInTank(i);
-                if (cur.isEmpty()) {
-                    long cap = handler.getTankCapacity(i);
-                    fluids.add(new SlotSnap(null, cap, cap, handler, i));
-                } else {
-                    AEFluidKey key = AEFluidKey.of(cur);
-                    IFluidTransfer transfer = gtlcore$asFluidTransfer(handler);
-                    long accepted = transfer != null ? transfer.fill(i, FluidHelperImpl.toFluidStack(key.toStack(Integer.MAX_VALUE)), true, false) : handler.fill(key.toStack(Integer.MAX_VALUE), IFluidHandler.FluidAction.SIMULATE);
-                    fluids.add(new SlotSnap(key, accepted, handler.getTankCapacity(i), handler, i));
-                }
-            }
-        }
-    }
-
-    /**
-     * Per-key probe capacity for targets where slot packing is irrelevant (network views, huge
-     * composite inventories): one simulated insert per key answers how much fits; divided by the
-     * per-operation amount that is the exact per-key bound, and the minimum across keys is the
-     * answer. Probes are shared per provider-side per tick across patterns. Multi-key results are
-     * verified with one full batch check; only disagreements fall back to the binary search.
-     */
-    @Unique
-    private long gtlcore$probeCapacity(PatternProviderTarget target, BlockEntity targetBE, Direction side,
-                                       KeyCounter baseInputs, long requestedOperations) {
-        long now = TickHandler.instance().getCurrentTick();
-        if (now != gtlcore$probeTick) {
-            gtlcore$probeTick = now;
-            gtlcore$probeCache.clear();
-        }
-        var targetCache = gtlcore$probeCache.computeIfAbsent(side, d -> new HashMap<>());
-
-        long cap = requestedOperations;
-        int keys = 0;
-        for (var input : baseInputs) {
-            long perOp = input.getLongValue();
-            if (perOp <= 0) {
-                continue;
-            }
-            keys++;
-            AEKey key = input.getKey();
-            Long cached = targetCache.get(key);
-            long fits;
-            if (cached != null) {
-                fits = cached;
-            } else {
-                // Probe with an unbounded budget: the answer is the target's real free space for
-                // this key, reusable for any request size.
-                fits = target.insert(key, Long.MAX_VALUE, Actionable.SIMULATE);
-                targetCache.put(key, fits);
-            }
-            cap = Math.min(cap, fits / perOp);
-            if (cap <= 0) {
-                return 0;
-            }
-        }
-        if (keys > 1 && cap < requestedOperations && !gtlcore$canTargetAccept(target, targetBE, side, baseInputs, cap)) {
-            // Probes disagreed with the batch reality - the slot-aware search is the arbiter.
-            return gtlcore$binarySearchCapacity(target, targetBE, side, baseInputs, cap);
-        }
-        return cap;
-    }
-
-    @Unique
-    private long gtlcore$binarySearchCapacity(PatternProviderTarget target, BlockEntity targetBE, Direction side,
-                                              KeyCounter baseInputs, long requestedOperations) {
-        long low = 0;
-        long high = requestedOperations - 1;
-        while (low < high) {
-            long middle = low + ((high - low + 1) >>> 1);
-            if (gtlcore$canTargetAccept(target, targetBE, side, baseInputs, middle)) {
-                low = middle;
-            } else {
-                high = middle - 1;
-            }
-        }
-        return low;
-    }
-
-    /**
-     * Real-handler batch acceptance check: can the target take `operations` operations' worth of
-     * every input key? Probes the actual capability with per-slot accounting, so slot sharing
-     * between keys is respected exactly.
-     */
     @Unique
     private boolean gtlcore$canTargetAccept(PatternProviderTarget target, BlockEntity targetBE, Direction side,
                                             KeyCounter baseInputs, long operations) {
