@@ -199,15 +199,20 @@ public class MEMolecularAssemblerIOPartMachine extends MEIOPartMachine implement
             }
         }
 
-        final GenericStack requireStack = processingPattern.getInputs()[0].getPossibleInputs()[0];
+        final var firstInput = processingPattern.getInputs()[0];
         long multiplier = 0;
         for (var inputList : keyCounters) {
             for (var input : inputList) {
-                if (requireStack.what().equals(input.getKey())) {
-                    multiplier = input.getLongValue() / (requireStack.amount() * processingPattern.getInputs()[0].getMultiplier());
+                for (var possible : firstInput.getPossibleInputs()) {
+                    if (!possible.what().equals(input.getKey())) continue;
+                    long cost = possible.amount() * firstInput.getMultiplier();
+                    if (cost <= 0) continue;
+                    multiplier = input.getLongValue() / cost;
                     break;
                 }
+                if (multiplier != 0) break;
             }
+            if (multiplier != 0) break;
         }
         if (multiplier == 0) return false;
 
@@ -219,14 +224,40 @@ public class MEMolecularAssemblerIOPartMachine extends MEIOPartMachine implement
     @Override
     public boolean gtlcore$canProduceGraphPattern(IPatternDetails pattern) {
         if (!getMainNode().isActive() || !(pattern instanceof AEProcessingPattern) || !patternSlotMap.containsKey(pattern)) return false;
+        return gtlcore$missingGraphTools(pattern).isEmpty();
+    }
+
+    private Set<Item> gtlcore$missingGraphTools(IPatternDetails pattern) {
+        if (!patternSlotMap.containsKey(pattern)) return Set.of();
         var required = toolsSlotMap.get(patternSlotMap.get(pattern));
-        if (required == null || required.isEmpty()) return true;
+        if (required == null || required.isEmpty()) return Set.of();
         var missing = new ObjectOpenHashSet<>(required);
         for (int i = 0; i < sharedToolsInventory.getSlots(); i++) {
             var stack = sharedToolsInventory.getStackInSlot(i);
             if (!stack.isDamageableItem()) missing.remove(stack.getItem());
         }
-        return missing.isEmpty();
+        return missing;
+    }
+
+    @Override
+    public String gtlcore$graphBlockReason(IPatternDetails pattern) {
+        return !getMainNode().isActive() || !patternSlotMap.containsKey(pattern) ? "PROVIDER_OFFLINE" :
+                gtlcore$missingGraphTools(pattern).isEmpty() ? "PROVIDER_REJECTED" : "MISSING_TOOL";
+    }
+
+    @Override
+    public String gtlcore$graphBlockDetail(IPatternDetails pattern) {
+        return "pos=" + getPos() + "; missing_shared_tools=" + gtlcore$missingGraphTools(pattern);
+    }
+
+    @Override
+    public Component gtlcore$graphBlockMessage(IPatternDetails pattern) {
+        var names = Component.empty();
+        for (var item : gtlcore$missingGraphTools(pattern)) {
+            if (!names.getSiblings().isEmpty()) names.append(", ");
+            names.append(item.getDescription());
+        }
+        return Component.translatable("gtlcore.ae.graph.shared_tool_location", names, getPos().toShortString());
     }
 
     @Override
@@ -276,6 +307,7 @@ public class MEMolecularAssemblerIOPartMachine extends MEIOPartMachine implement
     }
 
     private @Nullable IPatternDetails getPatternDetailsAsProcessing(ItemStack stack, int slotIndex) {
+        toolsSlotMap.remove(slotIndex);
         if (!stack.isEmpty()) {
             if (stack.getItem() instanceof EncodedPatternItem encodedPatternItem) {
                 final var decodePattern = encodedPatternItem.decode(stack, getLevel(), false);

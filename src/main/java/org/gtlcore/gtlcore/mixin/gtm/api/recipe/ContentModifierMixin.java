@@ -1,6 +1,7 @@
 package org.gtlcore.gtlcore.mixin.gtm.api.recipe;
 
 import org.gtlcore.gtlcore.api.recipe.IAdvancedContentModifier;
+import org.gtlcore.gtlcore.utils.datastructure.Int128;
 
 import com.gregtechceu.gtceu.api.recipe.content.ContentModifier;
 
@@ -49,12 +50,16 @@ public abstract class ContentModifierMixin implements IAdvancedContentModifier {
 
     @Unique
     private long gtlcore$saturatedFraction(long value) {
-        BigInteger result = BigInteger.valueOf(value)
-                .multiply(BigInteger.valueOf(numerator))
-                .divide(BigInteger.valueOf(denominator));
-        if (result.compareTo(BigInteger.valueOf(Long.MAX_VALUE)) > 0) return Long.MAX_VALUE;
-        if (result.compareTo(BigInteger.valueOf(Long.MIN_VALUE)) < 0) return Long.MIN_VALUE;
-        return result.longValue();
+        return new Int128(value).multiply(numerator).divide(denominator).longValue();
+    }
+
+    @Override
+    @Unique
+    public long applyExact(long value) {
+        if (!useFraction) return IAdvancedContentModifier.super.applyExact(value);
+        if (value < 0 || numerator < 0 || denominator <= 0) throw new IllegalArgumentException("Invalid exact modifier");
+        return BigInteger.valueOf(value).multiply(BigInteger.valueOf(numerator))
+                .divide(BigInteger.valueOf(denominator)).longValueExact();
     }
 
     @Override

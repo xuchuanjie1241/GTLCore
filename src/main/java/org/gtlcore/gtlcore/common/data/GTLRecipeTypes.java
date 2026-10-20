@@ -34,7 +34,7 @@ import static com.lowdragmc.lowdraglib.gui.texture.ProgressTexture.FillDirection
 
 public class GTLRecipeTypes {
 
-    public static final GTRecipeType PRIMITIVE_VOID_ORE_RECIPES = ConfigHolder.INSTANCE.enablePrimitiveVoidOre ?
+    public static final GTRecipeType PRIMITIVE_VOID_ORE_RECIPES = ConfigHolder.INSTANCE.content.enablePrimitiveVoidOre ?
             register("primitive_void_ore", MULTIBLOCK)
                     .setMaxIOSize(0, 0, 1, 0)
                     .setMaxTooltips(1)
@@ -175,7 +175,7 @@ public class GTLRecipeTypes {
             .addDataInfo(data -> {
                 int temp = data.getInt("ebf_temp");
                 ICoilType requiredCoil = ICoilType.getMinRequiredType(temp);
-                return LocalizationUtils.format("gtceu.recipe.coil.tier", (temp > 21600 && temp <= 32000) ? "超级热容" : I18n.get(requiredCoil.getMaterial().getUnlocalizedName()));
+                return LocalizationUtils.format("gtceu.recipe.coil.tier", (temp > 21600 && temp <= 32000) ? I18n.get("gtlcore.recipe.coil.super_heat_capacity") : I18n.get(requiredCoil.getMaterial().getUnlocalizedName()));
             })
             .setUiBuilder((recipe, widgetGroup) -> {
                 List<List<ItemStack>> items = new ArrayList<>();

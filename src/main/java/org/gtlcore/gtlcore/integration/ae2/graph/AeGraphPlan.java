@@ -1,9 +1,6 @@
 package org.gtlcore.gtlcore.integration.ae2.graph;
 
 import org.gtlcore.gtlcore.config.ConfigHolder;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.CraftingCostModel;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.ExactAmounts;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.GraphPlan;
 
 import appeng.api.crafting.IPatternDetails;
 import appeng.api.networking.crafting.ICraftingPlan;
@@ -11,6 +8,10 @@ import appeng.api.stacks.AEKey;
 import appeng.api.stacks.GenericStack;
 import appeng.api.stacks.KeyCounter;
 import appeng.crafting.CraftingPlan;
+import org.cgse.core.CraftingCostModel;
+import org.cgse.core.ExactAmounts;
+import org.cgse.core.GraphPlan;
+import org.cgse.core.RequestPlanningWork;
 
 import java.math.BigInteger;
 import java.util.Collections;
@@ -29,6 +30,7 @@ public final class AeGraphPlan implements ICraftingPlan {
     private final BigInteger exactBytes;
     private final CraftingCostModel.Mode costMode;
     private final boolean fallback;
+    private final RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate;
     private final UUID id = UUID.randomUUID();
     private final Map<String, BigInteger> selectedCounts;
     private final Map<IPatternDetails, Long> selectedPatterns;
@@ -42,8 +44,15 @@ public final class AeGraphPlan implements ICraftingPlan {
 
     public AeGraphPlan(GraphPlan<AEKey> graph, Map<String, IPatternDetails> bindings, Set<AEKey> emitable,
                        Map<AEKey, Long> stock, boolean fallback) {
+        this(graph, bindings, emitable, stock, fallback, null);
+    }
+
+    public AeGraphPlan(GraphPlan<AEKey> graph, Map<String, IPatternDetails> bindings, Set<AEKey> emitable,
+                       Map<AEKey, Long> stock, boolean fallback,
+                       RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate) {
         this.graph = graph;
         this.fallback = fallback;
+        this.reuseCandidate = reuseCandidate;
         this.bindings = Collections.unmodifiableMap(new LinkedHashMap<>(bindings));
         selectedCounts = graph.patternTimesExact();
         Map<IPatternDetails, BigInteger> selected = new LinkedHashMap<>();
@@ -61,7 +70,7 @@ public final class AeGraphPlan implements ICraftingPlan {
             if (emitable.contains(key) && deficit.signum() > 0) emissions.put(key, deficit);
         });
         this.emitted = Map.copyOf(emissions);
-        costMode = ConfigHolder.INSTANCE == null ? CraftingCostModel.Mode.LEGACY : ConfigHolder.INSTANCE.ae2GraphByteCostMode;
+        costMode = ConfigHolder.INSTANCE == null ? CraftingCostModel.Mode.LEGACY : ConfigHolder.INSTANCE.ae.ae2GraphByteCostMode;
         this.exactBytes = CraftingCostModel.bytes(graph, costMode, key -> key.getType().getAmountPerByte());
         this.bytes = ExactAmounts.capped(exactBytes);
     }
@@ -131,6 +140,10 @@ public final class AeGraphPlan implements ICraftingPlan {
 
     public CraftingCostModel.Mode costMode() {
         return costMode;
+    }
+
+    public RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate() {
+        return reuseCandidate;
     }
 
     /** The long UI view must not discount an exact cost larger than Long.MAX_VALUE. */

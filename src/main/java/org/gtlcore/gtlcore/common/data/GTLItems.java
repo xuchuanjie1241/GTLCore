@@ -2,6 +2,7 @@ package org.gtlcore.gtlcore.common.data;
 
 import org.gtlcore.gtlcore.client.renderer.item.VirtualIngredientRenderer;
 import org.gtlcore.gtlcore.common.item.*;
+import org.gtlcore.gtlcore.integration.ae2.CircuitInfinityCell;
 import org.gtlcore.gtlcore.integration.ae2.FastInfinityCell;
 import org.gtlcore.gtlcore.integration.ae2.InfinityCell;
 import org.gtlcore.gtlcore.utils.TextUtil;
@@ -15,6 +16,7 @@ import com.gregtechceu.gtceu.client.util.TooltipHelper;
 import com.gregtechceu.gtceu.common.data.GTItems;
 import com.gregtechceu.gtceu.common.item.CoverPlaceBehavior;
 import com.gregtechceu.gtceu.common.item.TooltipBehavior;
+import com.gregtechceu.gtceu.utils.FormattingUtil;
 
 import net.minecraft.ChatFormatting;
 import net.minecraft.network.chat.Component;
@@ -112,6 +114,7 @@ public class GTLItems {
     public static final ItemEntry<InfinityCell> ITEM_INFINITY_CELL = REGISTRATE.item("item_infinity_cell", p -> new InfinityCell(AEKeyType.items())).register();
     public static final ItemEntry<InfinityCell> FLUID_INFINITY_CELL = REGISTRATE.item("fluid_infinity_cell", p -> new InfinityCell(AEKeyType.fluids())).register();
     public static final ItemEntry<FastInfinityCell> FAST_INFINITY_CELL = REGISTRATE.item("fast_infinity_cell", p -> new FastInfinityCell()).register();
+    public static final ItemEntry<CircuitInfinityCell> CIRCUIT_INFINITY_CELL = REGISTRATE.item("circuit_infinity_cell", p -> new CircuitInfinityCell()).register();
 
     public static void InitUpgrades() {
         String storageCellGroup = GuiText.StorageCells.getTranslationKey();
@@ -193,7 +196,8 @@ public class GTLItems {
             .onRegister(attach(new CoverPlaceBehavior(GTLCovers.FLUID_REGULATOR_MAX)))
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.fluid.regulator.tooltip"));
-                lines.add(Component.translatable("gtceu.universal.tooltip.fluid_transfer_rate", 1048576));
+                lines.add(Component.translatable("gtceu.universal.tooltip.fluid_transfer_rate",
+                        FormattingUtil.formatNumbers(GTLCovers.fluidTransferRate(GTValues.MAX))));
             })))
             .register();
 
@@ -203,7 +207,7 @@ public class GTLItems {
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.electric.pump.tooltip"));
                 lines.add(Component.translatable("gtceu.universal.tooltip.fluid_transfer_rate",
-                        1280 * 64 * 64 * 4 / 20));
+                        FormattingUtil.formatNumbers(GTLCovers.fluidTransferRate(GTValues.MAX))));
             })))
             .register();
 
@@ -212,7 +216,8 @@ public class GTLItems {
             .onRegister(attach(new CoverPlaceBehavior(GTLCovers.CONVEYOR_MODULE_MAX)))
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.conveyor.module.tooltip"));
-                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks", 16));
+                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks",
+                        FormattingUtil.formatNumbers(GTLCovers.itemTransferRate(GTValues.MAX) / 64)));
             })))
             .register();
 
@@ -220,7 +225,8 @@ public class GTLItems {
             .onRegister(attach(new CoverPlaceBehavior(GTLCovers.ROBOT_ARM_MAX)))
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.robot.arm.tooltip"));
-                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks", 16));
+                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks",
+                        FormattingUtil.formatNumbers(GTLCovers.itemTransferRate(GTValues.MAX) / 64)));
             })))
             .register();
 
@@ -234,7 +240,8 @@ public class GTLItems {
             .onRegister(attach(new CoverPlaceBehavior(GTLCovers.ROBOT_ARM_ULV)))
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.robot.arm.tooltip"));
-                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks", 33554431));
+                lines.add(Component.translatable("gtceu.universal.tooltip.item_transfer_rate_stacks",
+                        FormattingUtil.formatNumbers(GTLCovers.itemTransferRate(GTValues.ULV) / 64)));
             })))
             .register();
 
@@ -243,7 +250,8 @@ public class GTLItems {
             .onRegister(attach(new CoverPlaceBehavior(GTLCovers.FLUID_REGULATORS_ULV)))
             .onRegister(attach(new TooltipBehavior(lines -> {
                 lines.add(Component.translatable("item.gtceu.fluid.regulator.tooltip"));
-                lines.add(Component.translatable("gtceu.universal.tooltip.fluid_transfer_rate", Integer.MAX_VALUE));
+                lines.add(Component.translatable("gtceu.universal.tooltip.fluid_transfer_rate",
+                        FormattingUtil.formatNumbers(GTLCovers.fluidTransferRate(GTValues.ULV))));
             })))
             .register();
 

@@ -4,7 +4,6 @@ import org.gtlcore.gtlcore.GTLCore;
 import org.gtlcore.gtlcore.config.ConfigHolder;
 import org.gtlcore.gtlcore.integration.ae2.crafting.CraftingDispatchReason;
 import org.gtlcore.gtlcore.integration.ae2.crafting.transfinite.MissingCraftingPlan;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.*;
 import org.gtlcore.gtlcore.mixin.ae2.logic.ElapsedTimeTrackerAccessor;
 
 import net.minecraft.nbt.CompoundTag;
@@ -29,6 +28,9 @@ import appeng.crafting.execution.CraftingSubmitResult;
 import appeng.crafting.execution.ElapsedTimeTracker;
 import appeng.hooks.ticking.TickHandler;
 import appeng.me.service.CraftingService;
+import org.cgse.core.*;
+import org.cgse.core.PlanningInventory;
+import org.cgse.core.ReplanCoordinator;
 
 import java.util.*;
 
@@ -51,14 +53,12 @@ public final class GraphCpuController {
     private String lastDiagnostic = "";
     private long progressVersion = -1, progressNanos, waitingLogNanos;
     private final GtlPatternCatalog replanCatalog = new GtlPatternCatalog();
-    private GraphPlanningRequest replanRequest;
-    private GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint;
+    private final ReplanCoordinator<AEKey, ICraftingPlan> replanning = new ReplanCoordinator<>();
+    private final ReplanHost replanHost = new ReplanHost();
     private GraphStorageWatch.Subscription dependencyWatch;
     private Map<AEKey, List<String>> failedBindings = Map.of();
     private long providerGeneration = Long.MIN_VALUE;
-    private boolean dependencyChanged;
     private Iterator<String> bindingsToCheck;
-    private final GraphReplanRetry replanRetry = new GraphReplanRetry();
     private String replanOrigin = "";
 
     public GraphCpuController(GraphCpuHost host) {
@@ -82,7 +82,9 @@ public final class GraphCpuController {
             return CraftingSubmitResult.CPU_TOO_SMALL;
         GraphPlan<AEKey> plan = view.graph();
         if (!plan.feasible()) {
-            if (!allowMissing || (plan.result() != GraphPlan.Result.MISSING_INPUT && plan.result() != GraphPlan.Result.MISSING_SEED)) return CraftingSubmitResult.INCOMPLETE_PLAN;
+            if (!allowMissing || (plan.result() != GraphPlan.Result.MISSING_INPUT && plan.result() != GraphPlan.Result.MISSING_SEED &&
+                    !plan.conditionalPreview()))
+                return CraftingSubmitResult.INCOMPLETE_PLAN;
             plan = new GraphPlan<>(plan.target(), plan.amount(), plan.preserveSeeds(), plan.steps(), plan.recipes(),
                     plan.initialExact(), plan.seeds(), Map.of(), GraphPlan.Result.FEASIBLE, plan.searchNodes(), plan.planningNanos());
         }
@@ -98,7 +100,7 @@ public final class GraphCpuController {
                 // Do not let Retry reproduce a catalog that execution has just rejected.
                 // No inventory has been extracted yet; the current plan remains rejected.
                 ((GraphRequestTracker) grid.getCraftingService()).gtlcore$invalidateGraphBinding(selected.binding());
-                if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.warn(
+                if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.warn(
                         "[Graph Crafting] submit rejected plan={} target={} amount={} recipe={} binding={} reason={} detail={} provider_revision={} captured_current={} selected_slots={} selected_outputs={} catalog_invalidated=true",
                         view.id(), plan.target(), plan.amount(), recipe, selected.binding(), preparedAdapter.bindingFailure(), preparedAdapter.bindingDetail(),
                         ((GraphRequestTracker) grid.getCraftingService()).gtlcore$graphProviderGeneration(),
@@ -170,7 +172,7 @@ public final class GraphCpuController {
         plan.patternTimesExact().forEach((recipe, count) -> runtime.plan().recipes().get(recipe).executionOutputs().forEach((key, amount) -> time.invokeAddMaxItems(ExactAmounts.capped(count.multiply(java.math.BigInteger.valueOf(amount))), key.getType())));
         publish(true);
         notifyOwner(CraftingJobStatusPacket.Status.STARTED);
-        if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
+        if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
                 "[Graph Crafting] submit accepted plan={} job={} cpu={} target={} amount={}",
                 view.id(), id, host.cpu().getClass().getName(), plan.target(), plan.amount());
         if (requester == null) return CraftingSubmitResult.successful(null);
@@ -212,21 +214,22 @@ public final class GraphCpuController {
     }
 
     private void logWaiting() {
-        if (!ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) return;
+        if (!ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) return;
         long now = System.nanoTime();
         if (progressVersion != runtime.version()) {
             progressVersion = runtime.version();
             progressNanos = waitingLogNanos = now;
             return;
         }
-        if (runtime.finished() || runtime.suspended() || runtime.expected().isEmpty() ||
+        if (runtime.finished() || runtime.suspended() ||
                 now - progressNanos < 30_000_000_000L || now - waitingLogNanos < 30_000_000_000L)
             return;
         waitingLogNanos = now;
         try {
             GTLCore.LOGGER.info("[Graph Crafting] job={} target={} waiting={} no_progress_s={} expected={} registered_providers={}",
                     link.getCraftingID(), runtime.plan().target(), runtime.reason(), (now - progressNanos) / 1_000_000_000L,
-                    runtime.expected().entrySet().stream().limit(4).toList(), adapter.waitingDetails(runtime.plan(), runtime.expected()));
+                    runtime.expected().entrySet().stream().limit(4).toList(), runtime.expected().isEmpty() ?
+                            adapter.blockedDetails() : adapter.waitingDetails(runtime.plan(), runtime.expected()));
         } catch (RuntimeException diagnosticFailure) {
             GTLCore.LOGGER.debug("Graph waiting diagnostic unavailable", diagnosticFailure);
         }
@@ -238,7 +241,7 @@ public final class GraphCpuController {
         if (mode == Actionable.MODULATE && accepted > 0) {
             ((ElapsedTimeTrackerAccessor) tracker).invokeDecrementItems(accepted, key.getType());
             host.changed(key);
-            host.requesting(key, runtime.waiting(key) > 0);
+            host.requesting(key, runtime.receivable(key) > 0);
             host.dirty();
             modifiedTick = TickHandler.instance().getCurrentTick();
         }
@@ -256,7 +259,7 @@ public final class GraphCpuController {
     /** Called by the native CPU's breakCluster after it cancels the task. */
     public void handoffCancelledInventory() {
         if (runtime == null || runtime.state() != GraphJobRuntime.State.CANCELLING) return;
-        if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
+        if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
                 "[Graph Crafting] job={} cancelled inventory handed to AE for CPU rebuild/break", link.getCraftingID());
         runtime.detachCancelledInventory().forEach((key, amount) -> host.orphanInventory().insert(key, amount, Actionable.MODULATE));
         finish();
@@ -268,7 +271,7 @@ public final class GraphCpuController {
         if (success) link.markDone();
         else link.cancel();
         notifyOwner(success ? CraftingJobStatusPacket.Status.FINISHED : CraftingJobStatusPacket.Status.CANCELLED);
-        if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
+        if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
                 "[Graph Crafting] job={} state={} dispatches={} rejects={} checks={} tick_calls={} tick_ms={}",
                 link.getCraftingID(), runtime.state(), runtime.dispatches(), runtime.rejections(), runtime.checks(), tickCalls, tickNanos / 1_000_000.0);
         for (AEKey key : indexed) {
@@ -287,7 +290,7 @@ public final class GraphCpuController {
     private void publish(boolean force) {
         if (runtime == null || !force && runtime.version() == observedVersion) return;
         observedVersion = runtime.version();
-        Set<AEKey> next = Set.copyOf(runtime.expected().keySet());
+        Set<AEKey> next = runtime.receivableKeys();
         Set<AEKey> changed = new HashSet<>(indexed);
         changed.addAll(next);
         changed.addAll(runtime.drainChangedKeys());
@@ -317,7 +320,7 @@ public final class GraphCpuController {
             // here can ask GT's holder to synchronously load the same chunk,
             // deadlocking its onLoad callback. Restore only the in-memory
             // return index now; the first live tick publishes the UI and save.
-            Set<AEKey> next = Set.copyOf(runtime.expected().keySet());
+            Set<AEKey> next = runtime.receivableKeys();
             for (AEKey key : indexed) if (!next.contains(key)) host.requesting(key, false);
             for (AEKey key : next) host.requesting(key, true);
             indexed = next;
@@ -372,11 +375,11 @@ public final class GraphCpuController {
     }
 
     public long waiting(AEKey key) {
-        return runtime == null ? 0 : runtime.waiting(key);
+        return runtime == null ? 0 : runtime.receivable(key);
     }
 
     public void waitingKeys(Set<AEKey> out) {
-        if (runtime != null) out.addAll(runtime.expected().keySet());
+        if (runtime != null) out.addAll(runtime.receivableKeys());
     }
 
     public boolean suspended() {
@@ -407,7 +410,7 @@ public final class GraphCpuController {
             // UI totals only; never used for transfer/accounting.
             long amount;
             try {
-                amount = CheckedAmounts.add(CheckedAmounts.add(stored(key), waiting(key)), pending(key));
+                amount = CheckedAmounts.add(CheckedAmounts.add(stored(key), runtime.waiting(key)), pending(key));
             } catch (ArithmeticException e) {
                 amount = Long.MAX_VALUE;
             }
@@ -422,7 +425,7 @@ public final class GraphCpuController {
                 CraftingDispatchReason.DISPATCH_IN_DOUBT.mask() : CraftingDispatchReason.PLAN_STALE.mask();
         if (runtime.suspended()) return CraftingDispatchReason.JOB_SUSPENDED.mask();
         if (!host.active()) return CraftingDispatchReason.CPU_INACTIVE.mask();
-        if (runtime.reason().startsWith("REPLAN")) return CraftingDispatchReason.PLAN_STALE.mask();
+        if (runtime.reason().startsWith("REPLAN") || runtime.needsStateReplan()) return CraftingDispatchReason.PLAN_STALE.mask();
         int waiting = 0;
         if (runtime.externalWaiting(key) > 0) waiting |= CraftingDispatchReason.WAITING_FOR_EXTERNAL.mask();
         if (runtime.inFlight(key) > 0) waiting |= CraftingDispatchReason.WAITING_FOR_OUTPUTS.mask();
@@ -457,16 +460,12 @@ public final class GraphCpuController {
     }
 
     private void clearReplan(boolean resetFailures) {
-        if (replanRequest != null) replanRequest.cancel(false);
-        replanRequest = null;
-        checkpoint = null;
+        replanning.clear(resetFailures);
         if (dependencyWatch != null) dependencyWatch.close();
         dependencyWatch = null;
         failedBindings = Map.of();
-        dependencyChanged = false;
         bindingsToCheck = null;
         if (resetFailures) {
-            replanRetry.reset();
             replanOrigin = "";
         }
     }
@@ -477,69 +476,41 @@ public final class GraphCpuController {
             clearReplan();
             return;
         }
+        // A predicted tool state is not funded inventory until its physical
+        // return has resolved. Keep accepting old flights before replanning.
+        if (runtime.pendingStateReturns()) return;
         long generation = ((GraphRequestTracker) service).gtlcore$graphProviderGeneration();
         long tick = TickHandler.instance().getCurrentTick();
         if (generation != providerGeneration) {
             providerGeneration = generation;
             bindingsToCheck = runtime.pendingRuns().keySet().iterator();
-            if (checkpoint != null && replanRequest == null && !bindingSignatures(service, failedBindings.keySet()).equals(failedBindings))
-                dependencyChanged = true;
+            if (replanning.waitingForDependency() && !bindingSignatures(service, failedBindings.keySet()).equals(failedBindings))
+                replanning.dependencyChanged();
         }
-        if (replanRequest != null) {
-            if (!replanRequest.isDone()) return;
-            GraphPlanningRequest request = replanRequest;
-            replanRequest = null;
-            if (!runtime.replanCurrent(checkpoint.epoch())) {
+        replanHost.service = service;
+        ReplanCoordinator.Update update = replanning.update(runtime, tick, replanHost);
+        switch (update) {
+            case INSTALLED -> {
+                clearReplan();
+                publish(true);
+                return;
+            }
+            case STALE -> {
                 clearReplan();
                 return;
             }
-            String failure = "REPLAN_UNKNOWN";
-            try {
-                AeGraphPlan selected = (AeGraphPlan) request.join();
-                if (!selected.graph().feasible()) failure = "REPLAN_" + selected.graph().result();
-                else if (!selected.fitsStorage(host.cpu().getAvailableStorage(), host.unboundedJobStorage())) failure = "REPLAN_CPU_TOO_SMALL";
-                else if (installReplan(selected)) {
-                    if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging)
-                        GTLCore.LOGGER.info("[Graph Crafting] job={} replan=installed committed_recipes={} remaining_recipes={}",
-                                link.getCraftingID(), runtime.committedRuns().size(), runtime.pendingRuns().size());
-                    clearReplan();
-                    publish(true);
-                    return;
-                } else failure = "REPLAN_RESOURCES_OR_PROVIDER_CHANGED";
-            } catch (RuntimeException e) {
-                Throwable cause = e;
-                while (cause.getCause() != null) cause = cause.getCause();
-                failure = "REPLAN_" + cause.getClass().getSimpleName() + ": " + cause.getMessage();
+            case RETRY -> {
+                clearReplan(false);
+                startReplan(service);
+                return;
             }
-            Set<AEKey> dependencies = new LinkedHashSet<>(request.dependencies());
-            // A completed snapshot includes the new suffix and recovery roots.
-            // Retired/committed recipes from the old plan must not keep waking it.
-            // Failed snapshot collection still needs a conservative fallback.
-            if (dependencies.isEmpty()) for (String id : runtime.pendingRuns().keySet()) {
-                var recipe = runtime.plan().recipes().get(id);
-                dependencies.addAll(recipe.inputs().keySet());
-                dependencies.addAll(recipe.outputs().keySet());
+            case WAITING, FAILED -> {
+                return;
             }
-            dependencies.add(runtime.plan().target());
-            dependencies.addAll(checkpoint.recoverySeeds().keySet());
-            failedBindings = bindingSignatures(service, dependencies);
-            if (dependencyWatch != null) dependencyWatch.close();
-            dependencyChanged = false;
-            dependencyWatch = ((GraphStorageWatch) host.grid().getStorageService())
-                    .gtlcore$watchGraphResources(dependencies, () -> dependencyChanged = true);
-            runtime.waitForReplanDependency(checkpoint.epoch(), failure);
-            int delay = replanRetry.failed(tick);
-            if (replanRetry.shouldLog(tick, failure)) GTLCore.LOGGER.info(
-                    "[Graph Crafting] job={} {}; failures={} retry_after_ticks={} watched_keys={} origin={}; waiting for relevant storage/provider change",
-                    link.getCraftingID(), failure, replanRetry.failures(), delay, dependencies.size(), replanOrigin);
-            return;
+            case IDLE -> {}
         }
-        if (checkpoint != null) {
-            // Keep the event latched while cooling down, including provider repairs.
-            // One notification is sufficient; a busy network cannot force one solve per tick.
-            if (runtime.suspended() || !dependencyChanged || !replanRetry.ready(tick)) return;
-            runtime.abortReplan(checkpoint.epoch(), "");
-            clearReplan(false);
+        if (runtime.stateReplanReady()) {
+            replanOrigin = "actual_return_state_changed";
             startReplan(service);
             return;
         }
@@ -562,10 +533,42 @@ public final class GraphCpuController {
         if (!bindingsToCheck.hasNext()) bindingsToCheck = null;
     }
 
+    private final class ReplanHost implements ReplanCoordinator.Host<AEKey, ICraftingPlan> {
+
+        private CraftingService service;
+        private int watchedKeys;
+
+        @Override
+        public String install(ICraftingPlan plan) {
+            AeGraphPlan selected = (AeGraphPlan) plan;
+            if (!selected.graph().feasible()) return "REPLAN_" + selected.graph().result();
+            if (!selected.fitsStorage(host.cpu().getAvailableStorage(), host.unboundedJobStorage())) return "REPLAN_CPU_TOO_SMALL";
+            if (!installReplan(selected)) return "REPLAN_RESOURCES_OR_PROVIDER_CHANGED";
+            if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging)
+                GTLCore.LOGGER.info("[Graph Crafting] job={} replan=installed committed_recipes={} remaining_recipes={}",
+                        link.getCraftingID(), runtime.committedRuns().size(), runtime.pendingRuns().size());
+            return null;
+        }
+
+        @Override
+        public void watch(Set<AEKey> dependencies, Runnable changed) {
+            watchedKeys = dependencies.size();
+            failedBindings = bindingSignatures(service, dependencies);
+            if (dependencyWatch != null) dependencyWatch.close();
+            dependencyWatch = ((GraphStorageWatch) host.grid().getStorageService())
+                    .gtlcore$watchGraphResources(dependencies, changed);
+        }
+
+        @Override
+        public void failed(String diagnostic, ReplanCoordinator.Failure failure) {
+            if (failure.shouldLog()) GTLCore.LOGGER.info(
+                    "[Graph Crafting] job={} {}; failures={} retry_after_ticks={} watched_keys={} origin={}; waiting for relevant storage/provider change",
+                    link.getCraftingID(), diagnostic, failure.attempts(), failure.delay(), watchedKeys, replanOrigin);
+        }
+    }
+
     private void startReplan(CraftingService service) {
-        if (runtime.remainingDelivery() <= 0) return;
-        checkpoint = runtime.beginReplan();
-        replanRequest = CraftingEngineRouter.replan(replanCatalog, host, service, checkpoint, runtime.plan().preserveSeeds());
+        replanning.begin(runtime, checkpoint -> CraftingEngineRouter.replan(replanCatalog, host, service, checkpoint, runtime.plan().preserveSeeds()));
     }
 
     private boolean installReplan(AeGraphPlan selected) {
@@ -576,14 +579,8 @@ public final class GraphCpuController {
             return false;
         }
         for (String id : replacement.patternTimes().keySet()) if (adapter.resolve(replacement.recipes().get(id)) == null) return false;
-        Map<AEKey, Long> forecast = runtime.forecastInventory();
-        Map<AEKey, Long> needed = new LinkedHashMap<>(), emitted = new LinkedHashMap<>();
-        replacement.initial().forEach((key, count) -> {
-            long extra = Math.max(0, count - forecast.getOrDefault(key, 0L));
-            long external = Math.min(extra, selected.emitted().getOrDefault(key, 0L));
-            if (external > 0) emitted.put(key, external);
-            if (extra > external) needed.put(key, extra - external);
-        });
+        var funding = PlanningInventory.requirements(replacement.initial(), runtime.forecastInventory(), selected.emitted());
+        Map<AEKey, Long> needed = funding.needed(), emitted = funding.emitted();
         var storage = host.grid().getStorageService().getInventory();
         for (var entry : needed.entrySet())
             if (storage.extract(entry.getKey(), entry.getValue(), Actionable.SIMULATE, host.source()) < entry.getValue()) return false;
@@ -596,7 +593,7 @@ public final class GraphCpuController {
                 if (actual > 0) taken.put(entry.getKey(), actual);
                 if (actual != entry.getValue()) return false;
             }
-            committed = runtime.replaceSuffix(checkpoint.epoch(), replacement, taken, emitted);
+            committed = runtime.replaceSuffix(replanning.checkpoint().epoch(), replacement, taken, emitted);
             if (committed) {
                 tracker = new ElapsedTimeTracker();
                 var time = (ElapsedTimeTrackerAccessor) tracker;

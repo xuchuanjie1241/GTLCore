@@ -1,7 +1,6 @@
 package org.gtlcore.gtlcore.client.ae2.graph;
 
 import org.gtlcore.gtlcore.integration.ae2.graph.*;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.*;
 import org.gtlcore.gtlcore.integration.ae2.wireless.WirelessAePackets;
 import org.gtlcore.gtlcore.integration.jei.JeiMissingIngredientBookmarks;
 
@@ -24,6 +23,7 @@ import appeng.client.gui.me.crafting.CraftConfirmScreen;
 import appeng.client.gui.widgets.IconButton;
 import appeng.client.gui.widgets.TabButton;
 import appeng.menu.me.crafting.CraftConfirmMenu;
+import org.cgse.core.*;
 
 import java.math.BigInteger;
 import java.util.*;
@@ -337,12 +337,13 @@ public final class CraftingRingScreen extends AESubScreen<CraftConfirmMenu, Craf
     }
 
     private static Model build(List<GraphRingView.Row> rows, AEKey target) {
+        var projection = org.gtlcore.gtlcore.integration.ae2.graph.GraphRingProjection.of(rows, target);
         List<GraphRingView.Row> resources = new ArrayList<>(), recipes = new ArrayList<>();
         List<GraphRecipe<AEKey>> selected = new ArrayList<>();
         Map<String, GraphRingView.Row> byRecipe = new LinkedHashMap<>();
         Map<AEKey, GraphRingView.Row> byResource = new LinkedHashMap<>();
         Map<AEKey, BigInteger> crafted = new LinkedHashMap<>(), used = new LinkedHashMap<>();
-        for (var row : rows) switch (row.kind()) {
+        for (var row : projection.rows()) switch (row.kind()) {
             case RESOURCE -> {
                 resources.add(row);
                 byResource.put(row.icon().what(), row);
@@ -359,6 +360,8 @@ public final class CraftingRingScreen extends AESubScreen<CraftConfirmMenu, Craf
             }
             default -> {}
         }
+        // The execution tab still refers to exact recipe IDs from the packet.
+        projection.aliases().forEach((id, representative) -> byRecipe.put(id, byRecipe.get(representative)));
         Set<AEKey> standalone = new LinkedHashSet<>(byResource.keySet());
         standalone.add(target);
         var topology = new PlanTopology<>(selected, standalone);

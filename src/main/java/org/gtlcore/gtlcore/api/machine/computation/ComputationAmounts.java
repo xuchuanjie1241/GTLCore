@@ -1,7 +1,11 @@
 package org.gtlcore.gtlcore.api.machine.computation;
 
+import org.gtlcore.gtlcore.api.recipe.IAdvancedContentModifier;
+import org.gtlcore.gtlcore.api.recipe.IAdvancedOCResult;
+
 import com.gregtechceu.gtceu.api.recipe.GTRecipe;
 import com.gregtechceu.gtceu.api.recipe.content.ContentModifier;
+import com.gregtechceu.gtceu.api.recipe.logic.OCResult;
 
 import java.math.BigDecimal;
 
@@ -31,14 +35,23 @@ public final class ComputationAmounts {
     public static long modify(long value, ContentModifier modifier) {
         if (value < 0 || !Double.isFinite(modifier.getMultiplier()) || !Double.isFinite(modifier.getAddition()))
             throw new IllegalArgumentException("Invalid CWU modifier");
-        BigDecimal result = BigDecimal.valueOf(value).multiply(BigDecimal.valueOf(modifier.getMultiplier()))
-                .add(BigDecimal.valueOf(modifier.getAddition()));
-        if (result.signum() < 0) throw new IllegalArgumentException("Negative modified CWU");
-        return result.toBigInteger().longValueExact();
+        long result = ((IAdvancedContentModifier) modifier).applyExact(value);
+        if (result < 0) throw new IllegalArgumentException("Negative modified CWU");
+        return result;
     }
 
     public static long total(GTRecipe recipe) {
         return recipe.data.contains(TOTAL_CWU) ? Math.max(1, recipe.data.getLong(TOTAL_CWU)) : Math.max(1, recipe.duration);
+    }
+
+    public static void applyOverclock(GTRecipe recipe, OCResult result) {
+        if (!recipe.data.getBoolean("duration_is_total_cwu") || !recipe.data.contains(TOTAL_CWU)) return;
+        var advanced = (IAdvancedOCResult) (Object) result;
+        long total = ComputationMath.overclockTotal(total(recipe), recipe.duration, result.getDuration(),
+                advanced.getDurationFactor(), advanced.getBaseOCLevel());
+        // Recipe copies may share data with the cached original. Never discount it.
+        recipe.data = recipe.data.copy();
+        recipe.data.putLong(TOTAL_CWU, total);
     }
 
     public static int duration(long total) {

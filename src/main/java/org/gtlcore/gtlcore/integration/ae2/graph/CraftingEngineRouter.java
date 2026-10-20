@@ -4,7 +4,6 @@ import org.gtlcore.gtlcore.GTLCore;
 import org.gtlcore.gtlcore.config.AECraftingEngine;
 import org.gtlcore.gtlcore.config.AEGraphSeedPolicy;
 import org.gtlcore.gtlcore.config.ConfigHolder;
-import org.gtlcore.gtlcore.integration.ae2.graph.core.*;
 
 import net.minecraft.world.level.Level;
 import net.minecraftforge.event.server.ServerStoppedEvent;
@@ -18,6 +17,9 @@ import appeng.api.networking.crafting.ICraftingSimulationRequester;
 import appeng.api.networking.security.IActionSource;
 import appeng.api.stacks.AEKey;
 import appeng.me.service.CraftingService;
+import org.cgse.core.*;
+import org.cgse.core.PlanningInventory;
+import org.cgse.core.RequestPlanningWork;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -32,19 +34,11 @@ public final class CraftingEngineRouter {
     private CraftingEngineRouter() {}
 
     static <K> Map<K, Long> planningAvailability(Map<K, Long> network, Map<K, Long> forecast) {
-        Map<K, Long> result = new LinkedHashMap<>(network);
-        forecast.forEach((key, count) -> result.merge(key, CheckedAmounts.nonNegative(count), (stored, owned) -> {
-            // Availability is a lower bound for a long-sized request, not an
-            // ownership ledger. An infinity cell plus real CPU-held material
-            // must not overflow before replanning even starts. Physical inputs,
-            // expected outputs and settlement continue to use exact arithmetic.
-            CheckedAmounts.nonNegative(stored);
-            return stored + Math.min(owned, Long.MAX_VALUE - stored);
-        }));
-        return result;
+        return PlanningInventory.availability(network, forecast);
     }
 
     private static PlanningScheduler scheduler;
+    private static final PlanningMemory GLOBAL_MEMORY = new PlanningMemory(512L << 20);
 
     private record PlanLogKey(AEKey target, long amount, CalculationStrategy strategy, GraphPlan.Result result, long epoch, int missing) {}
 
@@ -83,7 +77,7 @@ public final class CraftingEngineRouter {
 
     private static final class Settings {
 
-        static final AECraftingEngine ENGINE = ConfigHolder.INSTANCE.ae2CraftingEngine;
+        static final AECraftingEngine ENGINE = ConfigHolder.INSTANCE.ae.ae2CraftingEngine;
     }
 
     public static boolean useGraph() {
@@ -91,14 +85,33 @@ public final class CraftingEngineRouter {
     }
 
     private static synchronized PlanningScheduler scheduler() {
-        if (scheduler == null) scheduler = new PlanningScheduler(ConfigHolder.INSTANCE.ae2GraphPlannerThreads,
-                ConfigHolder.INSTANCE.ae2GraphPlannerMaxRequests, 4096, 2_000_000L);
+        if (scheduler == null) scheduler = new PlanningScheduler(ConfigHolder.INSTANCE.ae.ae2GraphPlannerThreads,
+                ConfigHolder.INSTANCE.ae.ae2GraphPlannerMaxRequests, ConfigHolder.INSTANCE.ae.ae2GraphSliceSteps,
+                ConfigHolder.INSTANCE.ae.ae2GraphSliceMicros * 1000L);
         return scheduler;
+    }
+
+    static PlanningBudget planningBudget(int parallelism) {
+        var options = ConfigHolder.INSTANCE.ae;
+        GLOBAL_MEMORY.limit(options.ae2GraphGlobalMemoryMiB * (1L << 20));
+        long search = PlanningBudget.parallelWorkLimit(options.ae2GraphPlannerMaxSteps,
+                parallelism, options.ae2GraphPlannerParallelWorkBudget);
+        long compilation = options.ae2GraphCompilerMaxSteps == 0 ? search : PlanningBudget.parallelWorkLimit(
+                options.ae2GraphCompilerMaxSteps, parallelism, options.ae2GraphPlannerParallelWorkBudget);
+        return new PlanningBudget(options.ae2GraphPlannerTimeoutMs, search, compilation,
+                options.ae2GraphCachePreparationMaxSteps, options.ae2GraphPlannerMemoryMiB * (1L << 20),
+                () -> false, System::nanoTime).memory(GLOBAL_MEMORY);
+    }
+
+    static RequestPlanningWork.FallbackLimits fallbackLimits() {
+        var options = ConfigHolder.INSTANCE.ae;
+        return new RequestPlanningWork.FallbackLimits(options.ae2GraphFallbackTimeoutMs,
+                options.ae2GraphFallbackMaxSteps, options.ae2GraphFallbackMemoryMiB * (1L << 20));
     }
 
     static CompletableFuture<GraphRingView> describe(GraphRingView.Builder work) {
         return scheduler().submit(work, new PlanningBudget(0, 1_000_000,
-                ConfigHolder.INSTANCE.ae2GraphPlannerMemoryMiB * (1L << 20), () -> false, System::nanoTime));
+                ConfigHolder.INSTANCE.ae.ae2GraphPlannerMemoryMiB * (1L << 20), () -> false, System::nanoTime).memory(GLOBAL_MEMORY));
     }
 
     @SubscribeEvent
@@ -114,15 +127,22 @@ public final class CraftingEngineRouter {
                                               Level level, ICraftingSimulationRequester requester,
                                               AEKey target, long amount, CalculationStrategy strategy) {
         return begin(catalog, grid, service, level, requester.getActionSource(), target, amount, strategy, null,
-                ConfigHolder.INSTANCE.ae2GraphSeedPolicy == AEGraphSeedPolicy.PRESERVE, requester instanceof SubmissionRefresh);
+                ConfigHolder.INSTANCE.ae.ae2GraphSeedPolicy == AEGraphSeedPolicy.PRESERVE, requester instanceof SubmissionRefresh,
+                requester instanceof SubmissionRefresh refresh ? refresh.candidate() : null);
     }
 
     /** A submitted preview lost stock; recheck extractable inventory instead of AE's delayed cache. */
     public static ICraftingSimulationRequester submissionRefresh(IActionSource source) {
-        return new SubmissionRefresh(source);
+        return submissionRefresh(source, null);
     }
 
-    private record SubmissionRefresh(IActionSource source) implements ICraftingSimulationRequester {
+    public static ICraftingSimulationRequester submissionRefresh(IActionSource source, AeGraphPlan previous) {
+        return new SubmissionRefresh(source, previous == null ? null : previous.reuseCandidate());
+    }
+
+    private record SubmissionRefresh(IActionSource source,
+                                     RequestPlanningWork.ReuseCandidate<AEKey> candidate)
+            implements ICraftingSimulationRequester {
 
         @Override
         public IActionSource getActionSource() {
@@ -133,23 +153,20 @@ public final class CraftingEngineRouter {
     public static GraphPlanningRequest replan(GtlPatternCatalog catalog, GraphCpuHost host, CraftingService service,
                                               GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint, boolean preserve) {
         return begin(catalog, host.grid(), service, host.level(), host.source(), checkpoint.target(), checkpoint.remaining(),
-                CalculationStrategy.REPORT_MISSING_ITEMS, checkpoint, preserve, false);
+                CalculationStrategy.REPORT_MISSING_ITEMS, checkpoint, preserve, false, null);
     }
 
     private static GraphPlanningRequest begin(GtlPatternCatalog catalog, IGrid grid, CraftingService service,
                                               Level level, IActionSource source, AEKey target, long amount, CalculationStrategy strategy,
-                                              GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint, boolean preserve, boolean refreshInventory) {
+                                              GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint, boolean preserve, boolean refreshInventory,
+                                              RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate) {
         if (amount <= 0) throw new IllegalArgumentException("Non-positive crafting request");
         PlanningScheduler planner = scheduler();
-        long workLimit = PlanningBudget.parallelWorkLimit(ConfigHolder.INSTANCE.ae2GraphPlannerMaxSteps,
-                planner.parallelism(), ConfigHolder.INSTANCE.ae2GraphPlannerParallelWorkBudget);
-        PlanningBudget budget = new PlanningBudget(ConfigHolder.INSTANCE.ae2GraphPlannerTimeoutMs,
-                workLimit, ConfigHolder.INSTANCE.ae2GraphPlannerMemoryMiB * (1L << 20),
-                () -> false, System::nanoTime);
+        PlanningBudget budget = planningBudget(planner.parallelism());
         GraphPlanningRequest result = new GraphPlanningRequest(budget);
-        if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) budget.enableMetrics();
+        if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) budget.enableMetrics();
         CompletableFuture<GtlPatternCatalog.Snapshot> snapshot = new CompletableFuture<>();
-        var work = new RequestWork(grid, snapshot, target, amount, strategy, budget, checkpoint, preserve, result);
+        var work = new RequestWork(grid, snapshot, target, amount, strategy, budget, checkpoint, preserve, result, reuseCandidate);
         // Admit before collecting world data; rejected/cancelled requests never collect a snapshot.
         var worker = planner.submit(work, budget);
         result.attach(worker);
@@ -171,9 +188,10 @@ public final class CraftingEngineRouter {
                     for (var cpu : service.getCpus()) if (!cpu.isBusy())
                         parallelism = (int) Math.max(parallelism, Math.min(4096L, (long) cpu.getCoProcessors() + 1));
                     // Published by completion of the snapshot future; workers never inspect CPUs.
-                    work.catalysts = new CatalystPolicy(parallelism, ConfigHolder.INSTANCE.ae2GraphMaxExtraCatalystCopies);
+                    work.catalysts = new CatalystPolicy(parallelism, ConfigHolder.INSTANCE.ae.ae2GraphMaxExtraCatalystCopies);
                     task = catalog.begin(grid, service, level, source, target,
-                            checkpoint == null ? Set.of() : checkpoint.recoverySeeds().keySet(), budget, refreshInventory);
+                            checkpoint == null ? Set.of() : checkpoint.recoverySeeds().keySet(), budget, refreshInventory,
+                            checkpoint == null ? Set.of() : checkpoint.forecast().keySet());
                 }
                 long preparationNanos = System.nanoTime() - captureStarted;
                 GraphSnapshots.enqueue(task, budget, snapshot, timing -> {
@@ -204,17 +222,14 @@ public final class CraftingEngineRouter {
         private final boolean preserve;
         private final GraphPlanningRequest request;
         private final boolean fallbackEnabled;
+        private final RequestPlanningWork.FallbackLimits fallbackLimits;
+        private final RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate;
         private GtlPatternCatalog.Snapshot snapshot;
         private CapturedPatternCatalog.Build preparing;
         private CapturedPatternCatalog.Prepared prepared;
         private GraphCompiler<AEKey> compiler;
-        private Map<AEKey, Long> available;
-        private CatalystPlanningWork<AEKey> current;
-        private GraphPlan<AEKey> selected;
-        private boolean partialSearch, directEmission, unavailableTarget, tryEstimate, tryNeighbor;
-        private boolean fallbackAttempted, fallbackMode;
-        private long low, high, middle, snapshotNanos, snapshotElapsedNanos, catalogPreparationNanos;
-        private long estimatedAmount;
+        private RequestPlanningWork<AEKey> planning;
+        private long snapshotNanos, snapshotElapsedNanos, catalogPreparationNanos;
         private long catalogPreparationStarted, catalogPreparationElapsed, catalogParallelNanos;
         private int catalogParallelBatches;
         private GraphSnapshots.Timing snapshotTiming;
@@ -223,7 +238,8 @@ public final class CraftingEngineRouter {
 
         private RequestWork(IGrid grid, CompletableFuture<GtlPatternCatalog.Snapshot> capture, AEKey target, long amount,
                             CalculationStrategy strategy, PlanningBudget budget,
-                            GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint, boolean preserve, GraphPlanningRequest request) {
+                            GraphJobRuntime.ReplanCheckpoint<AEKey> checkpoint, boolean preserve, GraphPlanningRequest request,
+                            RequestPlanningWork.ReuseCandidate<AEKey> reuseCandidate) {
             this.grid = grid;
             this.capture = capture;
             this.target = target;
@@ -233,7 +249,9 @@ public final class CraftingEngineRouter {
             this.checkpoint = checkpoint;
             this.preserve = preserve;
             this.request = request;
-            this.fallbackEnabled = ConfigHolder.INSTANCE.ae2GraphFallback;
+            this.fallbackEnabled = ConfigHolder.INSTANCE.ae.ae2GraphFallback;
+            this.fallbackLimits = CraftingEngineRouter.fallbackLimits();
+            this.reuseCandidate = reuseCandidate;
         }
 
         @Override
@@ -256,115 +274,41 @@ public final class CraftingEngineRouter {
                 compiler = prepared.compiler();
                 preparing = null;
                 request.dependencies(snapshot.structure().resources());
-                available = planningAvailability(snapshot.stock(), checkpoint == null ? Map.of() : checkpoint.forecast());
-                directEmission = snapshot.emitable().contains(target) && compiler.producers(target).isEmpty();
-                unavailableTarget = checkpoint == null && !snapshot.emitable().contains(target) && compiler.producers(target).isEmpty();
+                planning = new RequestPlanningWork<>(compiler, target, amount, snapshot.stock(), snapshot.emitable(),
+                        checkpoint, preserve, strategy == CalculationStrategy.CRAFT_LESS, strategy.toString(), catalysts,
+                        fallbackEnabled, snapshot.structure().boundedAlternatives(), budget, request::isCancelled, report -> {
+                            if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
+                                    "[Graph Crafting] fallback target={} amount={} trigger={} cycle_solving=false result={} work={} elapsed_ms={}",
+                                    report.target(), report.amount(), report.trigger(), report.result(), report.nodes(), report.elapsedNanos() / 1_000_000.0);
+                        }).fallbackLimits(fallbackLimits).reuseCandidate(reuseCandidate);
+                if (prepared.candidates() != null) planning.capturedCatalog(prepared.candidates());
                 budget.note("catalog", "recipes=" + compiler.catalog().size() + "; target_sources=" + compiler.producers(target).size() +
-                        "; stock_keys=" + available.size() + "; target_stock=" + available.getOrDefault(target, 0L) +
+                        "; stock_keys=" + planning.availability().size() + "; target_stock=" + planning.availability().getOrDefault(target, 0L) +
                         "; external=" + snapshot.emitable().size() + "; cache_hit=" + snapshot.cacheHit() +
                         "; input_alternatives_bounded=" + snapshot.structure().boundedAlternatives());
-                if (directEmission && checkpoint == null) available.remove(target);
-                current = calculation(amount);
             }
-            if (!current.advance(slice)) return false;
-            GraphPlan<AEKey> candidate = current.result();
-            if (!partialSearch) {
-                selected = candidate;
-                if (selected.feasible() || unavailableTarget || strategy != CalculationStrategy.CRAFT_LESS || selected.missing().isEmpty()) return finish();
-                partialSearch = true;
-                low = 1;
-                high = amount - 1;
-                estimatedAmount = estimateAmount(candidate);
-                tryEstimate = estimatedAmount > 1;
-                middle = 1;
-            } else {
-                if (candidate.feasible()) {
-                    selected = candidate;
-                    low = middle + 1;
-                } else if (candidate.missing().isEmpty()) {
-                    budget.note("craft_less", "undecided_probe=" + middle + "; retained_amount=" + selected.amount());
-                    return finishReduced();
-                } else high = middle - 1;
-                if (tryEstimate && estimatedAmount >= low && estimatedAmount <= high) {
-                    middle = estimatedAmount;
-                    tryNeighbor = true;
-                } else if (tryNeighbor && candidate.feasible()) {
-                    middle = low;
-                    tryNeighbor = false;
-                } else {
-                    middle = low + (high - low) / 2;
-                    tryNeighbor = false;
-                }
-                tryEstimate = false;
-            }
-            if (low > high) return finish();
-            current.close();
-            current = calculation(middle);
-            return false;
-        }
-
-        private CatalystPlanningWork<AEKey> calculation(long count) {
-            budget.note("request", "target=" + target + "; amount=" + count + "; strategy=" + strategy + "; preserve_seeds=" + preserve);
-            // Feasibility probes must not each repeat the optional catalyst
-            // acceleration search. Preserve the shared order budget.
-            return new CatalystPlanningWork<>(checkpoint != null || strategy == CalculationStrategy.CRAFT_LESS ? CatalystPolicy.MINIMAL : catalysts, budget,
-                    policy -> new GraphPlanningWork<>(compiler, target, count, available, snapshot.emitable(),
-                            checkpoint == null ? Map.of() : checkpoint.recoverySeeds(), preserve, checkpoint == null && !directEmission, budget).catalysts(policy));
-        }
-
-        private long estimateAmount(GraphPlan<AEKey> full) {
-            java.math.BigInteger guess = java.math.BigInteger.valueOf(amount);
-            for (var entry : full.initialExact().entrySet()) {
-                if (snapshot.emitable().contains(entry.getKey()) || entry.getValue().signum() == 0) continue;
-                java.math.BigInteger scaled = java.math.BigInteger.valueOf(amount)
-                        .multiply(java.math.BigInteger.valueOf(available.getOrDefault(entry.getKey(), 0L)))
-                        .divide(entry.getValue());
-                guess = guess.min(scaled);
-            }
-            // A probe hint, never an upper-bound proof: batches, alternative
-            // sources and startup costs need not scale with order quantity.
-            return guess.max(java.math.BigInteger.ONE).longValueExact();
-        }
-
-        private boolean finishReduced() {
-            if (selected.feasible()) selected = new GraphPlan<>(selected.target(), selected.amount(), selected.preserveSeeds(), selected.steps(),
-                    selected.recipes(), selected.initialExact(), selected.seeds(), Map.of(), GraphPlan.Result.FEASIBLE_NOT_PROVEN_OPTIMAL,
-                    budget.nodes(), selected.planningNanos());
+            if (!planning.advance(slice)) return false;
             return finish();
-        }
-
-        @Override
-        public void close() {
-            if (current != null) current.close();
-        }
-
-        private RuntimeException limitOrUnknown(GraphPlan<AEKey> plan) {
-            return switch (plan.result()) {
-                case TIMEOUT, SEARCH_LIMIT, MEMORY_LIMIT, GRAPH_LIMIT, QUEUE_LIMIT -> new PlanningBudget.Exhausted(PlanningBudget.Limit.valueOf(plan.result().name()), budget.failureDetail());
-                default -> new GraphPlanningFailure(plan.result(), budget.failureDetail());
-            };
         }
 
         private void logFailure(Throwable error) {
             Throwable cause = error;
             while (cause.getCause() != null && cause.getCause() != cause) cause = cause.getCause();
             if (cause instanceof java.util.concurrent.CancellationException) return;
-            if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.warn(
+            if (ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging) GTLCore.LOGGER.warn(
                     "[Graph Crafting] plan failed target={} amount={} phase={} nodes={} reserved_bytes={} elapsed_ms={} detail={} strategies={} error={}",
                     target, amount, budget.phase(), budget.nodes(), budget.peakBytes(), budget.elapsedNanos() / 1_000_000.0,
                     budget.failureDetail(), budget.diagnostics(), cause.toString(), error);
         }
 
         private boolean finish() {
-            if (!selected.feasible() && selected.missing().isEmpty() && !fallback(selected.result())) throw limitOrUnknown(selected);
-            if (!selected.feasible() && snapshot.structure().boundedAlternatives() && !fallbackMode && !fallback(GraphPlan.Result.SEARCH_LIMIT))
-                throw budget.exhausted(PlanningBudget.Limit.SEARCH_LIMIT, "input_alternatives_bounded; missing preview is not a proof for omitted alternatives");
-            Map<AEKey, Long> extractionStock = new LinkedHashMap<>(available);
-            if (directEmission && checkpoint == null) extractionStock.remove(target);
+            GraphPlan<AEKey> selected = planning.result();
+            Map<AEKey, Long> extractionStock = new LinkedHashMap<>(planning.availability());
             long assemblyStarted = System.nanoTime();
-            result = new AeGraphPlan(selected, prepared.bindings(), snapshot.emitable(), extractionStock, fallbackMode);
+            result = new AeGraphPlan(selected, prepared.bindings(), snapshot.emitable(), extractionStock,
+                    planning.fallbackMode(), planning.reuseCandidate());
             long assemblyNanos = System.nanoTime() - assemblyStarted;
-            long skipped = ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging ? logAllowance(grid,
+            long skipped = ConfigHolder.INSTANCE.diagnostics.ae2GraphDiagnosticLogging ? logAllowance(grid,
                     new PlanLogKey(target, amount, strategy, selected.result(), snapshot.epoch(), selected.missingExact().hashCode())) : -1;
             if (skipped >= 0) GTLCore.LOGGER.info(
                     "[Graph Crafting] plan target={} result={} amount={} snapshot_ms={} planner_ms={} queue_ms={} patterns={} nodes={} cache_hit={} bytes={} byte_cost_mode={} plan={} snapshot_elapsed_ms={} snapshot_wait_ms={} plan_assembly_ms={} catalog_prepare_ms={} snapshot_idle_ms={} snapshot_tick_slices={} snapshot_idle_slices={} snapshot_max_slice_ms={} catalog_elapsed_ms={} catalog_parallel_ms={} catalog_parallel_batches={} target_sources={} catalog_recipes={} missing={} suppressed_repeats={}",
@@ -380,43 +324,11 @@ public final class CraftingEngineRouter {
             return true;
         }
 
-        /** One bounded ordinary expansion, never another cycle solver or a legacy engine request. */
-        private boolean fallback(GraphPlan.Result reason) {
-            if (!fallbackEnabled || fallbackAttempted || request.isCancelled() || compiler == null || prepared == null || available == null)
-                return false;
-            if (!switch (reason) {
-                case UNKNOWN, INFEASIBLE, TIMEOUT, SEARCH_LIMIT, MEMORY_LIMIT, GRAPH_LIMIT -> true;
-                default -> false;
-            }) return false;
-            fallbackAttempted = true;
-            // Stop any count-search siblings before releasing their state. The
-            // fallback has its own small allowance, not a refund of spent work.
-            budget.cancel();
-            if (current != null) {
-                current.close();
-                current = null;
-            }
-            PlanningBudget quick = new PlanningBudget(250, 131_072, 16L << 20, request::isCancelled, System::nanoTime);
-            try {
-                selected = GraphFallback.plan(compiler, target, amount, available, snapshot.emitable(),
-                        checkpoint == null ? Map.of() : checkpoint.recoverySeeds(), preserve, checkpoint == null && !directEmission, quick);
-                fallbackMode = true;
-                budget.note("fallback", "cycle_solving=false; reason=" + reason + "; work=" + quick.nodes() + "; result=" + selected.result());
-                if (ConfigHolder.INSTANCE.ae2GraphDiagnosticLogging) GTLCore.LOGGER.info(
-                        "[Graph Crafting] fallback target={} amount={} trigger={} cycle_solving=false result={} work={} elapsed_ms={}",
-                        target, amount, reason, selected.result(), quick.nodes(), quick.elapsedNanos() / 1_000_000.0);
-                return true;
-            } catch (PlanningBudget.Exhausted exhausted) {
-                budget.note("fallback", "cycle_solving=false; trigger=" + reason + "; stopped=" + exhausted.limit() + "; work=" + quick.nodes());
-                return false;
-            }
-        }
-
         @Override
         public CompletableFuture<?> waitingFor() {
             if (!capture.isDone()) return capture;
             if (preparing != null) return preparing.waitingFor();
-            return current == null ? null : current.waitingFor();
+            return planning == null ? null : planning.waitingFor();
         }
 
         @Override
@@ -425,18 +337,21 @@ public final class CraftingEngineRouter {
         }
 
         @Override
+        public void close() {
+            try {
+                if (planning != null) planning.close();
+                if (preparing != null) preparing.close();
+                if (!capture.isDone()) capture.cancel(false);
+            } finally {
+                if (snapshot != null) snapshot.structure().catalog().refreshRetainedBytes();
+            }
+        }
+
+        @Override
         public ICraftingPlan limited(PlanningBudget.Exhausted limit) {
-            if (current != null) {
-                GraphPlan<AEKey> retained = current.limited(limit);
-                if (retained.feasible()) selected = retained;
-            }
-            if (selected == null || !selected.feasible() && (!partialSearch || selected.missingExact().isEmpty())) {
-                if (!fallback(GraphPlan.Result.valueOf(limit.limit().name()))) throw limit;
-                finish();
-                return result;
-            }
-            budget.note("craft_less", "limit=" + limit.limit() + "; retained_amount=" + selected.amount() + "; result=" + selected.result());
-            finishReduced();
+            if (planning == null) throw limit;
+            planning.limited(limit);
+            finish();
             return result;
         }
     }
